@@ -16,6 +16,8 @@ Response shape is stable across modes. Fields not applicable to a given mode are
   - seller_only   →  product = null, technical = null
 */
 import { PlaywrightCrawler, ProxyConfiguration, Dataset } from "crawlee";
+import got from "got";
+import * as cheerio from "cheerio";
 import fs from "fs/promises";
 import fsSync from "fs";
 import 'dotenv/config';
@@ -58,6 +60,18 @@ function getEstimatedDaysLeft(dateText) {
     return Math.round(diffMs / (1000 * 60 * 60 * 24));
 }
 
+function makePhaseLogger(log, label) {
+    const t0 = Date.now();
+    let last = t0;
+    return (name) => {
+        const now = Date.now();
+        const step = ((now - last) / 1000).toFixed(2);
+        const total = ((now - t0) / 1000).toFixed(2);
+        log.info(`[${label}] ${name} | step=${step}s | total=${total}s`);
+        last = now;
+    };
+}
+
 function emptySellerSection() {
     return {
         profileUrl: null,
@@ -88,10 +102,12 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_with_seller'];
 
     let mode = 'product_with_seller';
     let inputUrls = [];
+    let extractShippingOptions = false;
     try {
         const input = await Actor.getInput();
         mode = input?.mode || 'product_with_seller';
         inputUrls = input?.startUrls || input?.productUrls || input?.sellerUrls || [];
+        extractShippingOptions = input?.extractShippingOptions === true;
     } catch (err) {
         console.error("Failed to read input:", err);
         return;
@@ -168,6 +184,10 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_with_seller'];
         },
         preNavigationHooks: [
             async ({ page, request }) => {
+                // NOTE: do NOT use page.route() to block images/fonts/etc on www.ebay.com.
+                // It changes the resource-loading fingerprint and Akamai serves
+                // /splashui/captcha challenges on /fdbk/* (review/feedback) endpoints.
+                // Tested 2026-05-07: blocking caused all review URLs to hit captcha.
                 await page.setExtraHTTPHeaders({
                     'Accept-Language': 'en-US,en;q=0.9',
                     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
@@ -221,6 +241,31 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_with_seller'];
 
     // ──────────────────── ITEM ────────────────────
     crawler.router.addHandler("ITEM", async ({ page, request, parseWithCheerio, log }) => {
+        const phase = makePhaseLogger(log, 'ITEM');
+        phase('handler start');
+
+        // Extract item ID from URL up-front (no page load needed) so we can
+        // kick off the description HTTP fetch in parallel with the Playwright
+        // page work. The ~1-3.5s of network latency hides inside the page-load
+        // time entirely instead of being added on at the end.
+        const platformMatch = request.url.match(/\/itm\/(?:[^/]+\/)?(\d+)/);
+        const platformItemId = platformMatch ? platformMatch[1] : null;
+
+        // Plain `got` (not gotScraping) — itm.ebaydesc.com has no Akamai, no
+        // browser fingerprint needed. No proxy needed either.
+        const descriptionPromise = platformItemId
+            ? got({
+                url: `https://itm.ebaydesc.com/itmdesc/${platformItemId}`,
+                timeout: { request: 15000 },
+                headers: { referer: request.url },
+                throwHttpErrors: false,
+                retry: { limit: 1 },
+            }).catch((err) => {
+                log.warning(`DESCRIPTION fetch failed: ${err.message}`, { itemId: platformItemId });
+                return null;
+            })
+            : Promise.resolve(null);
+
         const apiEndpoints = [];
         const requestTracker = (req) => {
             const resourceType = req.resourceType();
@@ -234,11 +279,12 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_with_seller'];
         // Falls through after 20s max if eBay's slow; cheerio parsing tolerates partial DOM.
         await page.waitForSelector('h1.x-item-title__mainTitle, div.x-price-primary', { timeout: 20000 })
             .catch(() => log.warning('ITEM: main title/price not rendered within 20s'));
+        phase('main DOM rendered (h1/price wait)');
         const $ = await parseWithCheerio();
+        phase('first parseWithCheerio done');
 
         const url = request.url;
-        const platformMatch = url.match(/\/itm\/(?:[^/]+\/)?(\d+)/);
-        const platformItemId = platformMatch ? platformMatch[1] : null;
+        // platformItemId already extracted at handler start (above) for parallel description fetch
 
         const mpn = $('dl.ux-labels-values--mpn dd.ux-labels-values__values span.ux-textspans').text().trim() || null;
         const upc = $('dl.ux-labels-values--upc dd.ux-labels-values__values span.ux-textspans').text().trim() || null;
@@ -340,11 +386,16 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_with_seller'];
             itemCountryCode = countries.getAlpha2Code(country, "en") || null;
         }
 
+        phase('cheerio metadata extracted');
+
         await page.evaluate(() => {
             const el = document.querySelector('.x-feedback-detail-list, .ux-summary__start--rating, [class*="reviews"]');
             if (el) el.scrollIntoView();
         });
-        await page.waitForSelector('span.ux-summary__start--rating, div.ux-histogram__item--bar', { timeout: 8000 }).catch(() => {});
+        // Reduced from 8s to 3s. Widget often lazy-loads beyond 3s but rating
+        // data is non-critical and items without reviews never render the widget anyway.
+        await page.waitForSelector('span.ux-summary__start--rating, div.ux-histogram__item--bar', { timeout: 3000 }).catch(() => {});
+        phase('rating section ready (scroll+wait)');
 
         const { rating, reviewCount, ratingBreakdown } = await page.evaluate(() => {
             const ratingText = document.querySelector('span.ux-summary__start--rating .ux-textspans')?.textContent?.trim() || '';
@@ -437,48 +488,66 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_with_seller'];
         const jsBundles = await page.$$eval('script[src]', scripts => scripts.map(s => s.src));
         const cssBundles = await page.$$eval('link[rel="stylesheet"]', links => links.map(l => l.href));
 
-        const shippingButton = await page.$('div.ux-labels-values--shipping button span');
+        phase('tracking IDs + bundles extracted');
+
         const shippingOptions = [];
-        const isShippingButtonVisible = shippingButton
-            ? await shippingButton.isVisible().catch(() => false)
-            : false;
-        if (shippingButton && isShippingButtonVisible) {
-            await shippingButton.scrollIntoViewIfNeeded().catch(() => {});
-            await shippingButton.evaluate(el => el.click());
-            // Wait up to 10s for the country dropdown; skip the whole block if it never renders.
-            const countrySelect = await page.waitForSelector('#shCountry', { timeout: 10000 }).catch(() => null);
-            if (countrySelect) {
-                const options = await countrySelect.$$('option');
-                for (const option of options) {
-                    const value = await option.getAttribute('value');
-                    if (value) {
-                        const label = (await option.textContent())?.trim() || null;
-                        log.info(`ITEM: shipping country selected`, { value, label });
-                        await countrySelect.selectOption(value);
-                        break;
+        if (extractShippingOptions) {
+            const shippingButton = await page.$('div.ux-labels-values--shipping button span');
+            const isShippingButtonVisible = shippingButton
+                ? await shippingButton.isVisible().catch(() => false)
+                : false;
+            if (shippingButton && isShippingButtonVisible) {
+                await shippingButton.scrollIntoViewIfNeeded().catch(() => {});
+                await shippingButton.evaluate(el => el.click());
+                // Wait up to 10s for the country dropdown; skip the whole block if it never renders.
+                const countrySelect = await page.waitForSelector('#shCountry', { timeout: 10000 }).catch(() => null);
+                if (countrySelect) {
+                    // Pick US explicitly. Previously the loop took the first option with a value,
+                    // which was alphabetically "American Samoa" (value="7") — incorrect for shipping cost.
+                    let selectedLabel = null;
+                    try {
+                        await countrySelect.selectOption({ label: 'United States' });
+                        selectedLabel = 'United States';
+                    } catch (_) {
+                        // Fallback: search options for one matching US
+                        const options = await countrySelect.$$('option');
+                        for (const option of options) {
+                            const label = (await option.textContent())?.trim() || '';
+                            if (/^(united states|usa|us)$/i.test(label)) {
+                                const value = await option.getAttribute('value');
+                                if (value) {
+                                    await countrySelect.selectOption(value);
+                                    selectedLabel = label;
+                                    break;
+                                }
+                            }
+                        }
                     }
+                    log.info(`ITEM: shipping country selected`, { label: selectedLabel });
+                    await page.click('button:has-text("Update")').catch(() => {});
+                    await page.locator('div.ux-labels-values--deliveryto span.ux-textspans--BOLD').first().waitFor({ state: 'visible', timeout: 10000 }).catch(() => {});
+                    const selector = await parseWithCheerio();
+                    const boldSpans = selector('div.ux-labels-values--deliveryto span[class="ux-textspans ux-textspans--BOLD"]');
+                    const shippingPrice = selector('div.ux-labels-values--deliveryto > div.ux-labels-values__values > div > div:nth-child(3)').text().trim();
+                    let shipPrice = 0, shipCurrency = "USD";
+                    const parsed = parseCurrency(shippingPrice);
+                    if (parsed) { shipPrice = parsed.cost; shipCurrency = parsed.currency; }
+                    if (boldSpans.length > 0) {
+                        shippingOptions.push({
+                            name: selector(boldSpans[0]).text().trim(),
+                            cost: shipPrice,
+                            currency: shipCurrency,
+                            estimatedDeliveryMinDays: getEstimatedDaysLeft(selector(boldSpans[1]).text().trim()),
+                            estimatedDeliveryMaxDays: getEstimatedDaysLeft(selector(boldSpans[2]).text().trim())
+                        });
+                    }
+                } else {
+                    log.warning('ITEM: shipping country dropdown did not render, skipping shipping options');
                 }
-                await page.click('button:has-text("Update")').catch(() => {});
-                await page.locator('div.ux-labels-values--deliveryto span.ux-textspans--BOLD').first().waitFor({ state: 'visible', timeout: 10000 }).catch(() => {});
-                const selector = await parseWithCheerio();
-                const boldSpans = selector('div.ux-labels-values--deliveryto span[class="ux-textspans ux-textspans--BOLD"]');
-                const shippingPrice = selector('div.ux-labels-values--deliveryto > div.ux-labels-values__values > div > div:nth-child(3)').text().trim();
-                let shipPrice = 0, shipCurrency = "USD";
-                const parsed = parseCurrency(shippingPrice);
-                if (parsed) { shipPrice = parsed.cost; shipCurrency = parsed.currency; }
-                if (boldSpans.length > 0) {
-                    shippingOptions.push({
-                        name: selector(boldSpans[0]).text().trim(),
-                        cost: shipPrice,
-                        currency: shipCurrency,
-                        estimatedDeliveryMinDays: getEstimatedDaysLeft(selector(boldSpans[1]).text().trim()),
-                        estimatedDeliveryMaxDays: getEstimatedDaysLeft(selector(boldSpans[2]).text().trim())
-                    });
-                }
-            } else {
-                log.warning('ITEM: shipping country dropdown did not render, skipping shipping options');
             }
         }
+
+        phase('shipping block done');
 
         // Wait for the delivery-to block to materialize if it exists. Skip the wait
         // entirely when the element isn't on the page to save ~10s.
@@ -560,26 +629,21 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_with_seller'];
             return urls;
         });
 
-        const descriptionUrl = "https://itm.ebaydesc.com/itmdesc/" + platformItemId;
-        await crawler.addRequests([{
-            url: descriptionUrl,
-            label: "DESCRIPTION",
-            userData: { scrappedItem, feedbackUrls }
-        }]);
-    });
+        // Await the description fetch we kicked off at the top of the handler.
+        // By now, ~5-10s of Playwright work has happened in parallel, so the
+        // 1-3.5s HTTP fetch usually has already resolved (step≈0s).
+        const descRes = await descriptionPromise;
+        if (descRes && descRes.statusCode === 200 && descRes.body) {
+            const $desc = cheerio.load(descRes.body);
+            $desc('script, style').remove();
+            scrappedItem.product.description.html = $desc.html();
+            scrappedItem.product.description.plainText = $desc('body').text().replace(/\s+/g, ' ').trim();
+        } else if (descRes) {
+            log.warning(`DESCRIPTION fetch ${descRes.statusCode}`, { itemId: platformItemId });
+        }
+        phase('description awaited (parallel got)');
 
-    // ──────────────────── DESCRIPTION ────────────────────
-    crawler.router.addHandler("DESCRIPTION", async ({ request, log, parseWithCheerio }) => {
-        const $ = await parseWithCheerio();
-        $('script, style').remove();
-        const plainText = $('body').text().replace(/\s+/g, ' ').trim();
-        const html = $.html();
-
-        const scrappedItem = request.userData.scrappedItem;
-        scrappedItem.product.description.plainText = plainText;
-        scrappedItem.product.description.html = html;
-
-        const feedbackUrls = request.userData.feedbackUrls;
+        // Enqueue ITEM_REVIEWS directly (DESCRIPTION queue round-trip removed)
         if (feedbackUrls?.negative || feedbackUrls?.positive) {
             // Primary URL drives Crawlee navigation; the other is opened on a second
             // page inside ITEM_REVIEWS so both scrape concurrently in one handler.
@@ -597,12 +661,16 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_with_seller'];
             log.warning('No product feedback URL found, skipping product reviews, going to seller');
             await chainToSeller(scrappedItem, log);
         }
+        phase('ITEM handler done (enqueued next)');
     });
 
     // ──────────────────── ITEM_REVIEWS ────────────────────
     // Scrape negative + positive review samples in parallel on two pages
     // sharing the same browser context (cookies, proxy, session).
     crawler.router.addHandler("ITEM_REVIEWS", async ({ page, request, log }) => {
+        const phase = makePhaseLogger(log, 'ITEM_REVIEWS');
+        phase('handler start');
+
         const scrappedItem = request.userData.scrappedItem;
         const { negativeUrl, positiveUrl } = request.userData;
 
@@ -666,6 +734,7 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_with_seller'];
                 );
             }
             const [primarySamples, secondarySamples = []] = await Promise.all(tasks);
+            phase('parallel review pages scraped');
 
             const negativeSamples = primaryIsNegative ? primarySamples : secondarySamples;
             const positiveSamples = primaryIsNegative ? secondarySamples : primarySamples;
@@ -675,6 +744,7 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_with_seller'];
             log.info(`ITEM_REVIEWS: negative=${negativeSamples.length}, positive=${positiveSamples.length}`);
 
             await chainToSeller(scrappedItem, log);
+            phase('ITEM_REVIEWS handler done (chained to seller)');
         } finally {
             if (secondaryPage) await secondaryPage.close().catch(() => {});
         }
@@ -729,11 +799,15 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_with_seller'];
     // Extract real seller URL from .str-seller-card if present, else from links
     // that point to /str/{slug} or /usr/{slug}, else construct from the path slug.
     crawler.router.addHandler("SELLER_HUB", async ({ page, request, log }) => {
+        const phase = makePhaseLogger(log, 'SELLER_HUB');
+        phase('handler start');
+
         const scrappedItem = request.userData.scrappedItem;
         try {
             await page.waitForSelector('.str-seller-card, a[href*="/str/"], a[href*="/usr/"]', { timeout: 20000 }).catch(() => {
                 log.warning(`SELLER_HUB: no seller-card or store/user link found`, { url: request.url });
             });
+            phase('seller card/link wait done');
 
             const resolvedSellerUrl = await page.evaluate(() => {
                 const pick = (sel) => document.querySelector(sel)?.href || null;
@@ -782,6 +856,7 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_with_seller'];
                 label: "SELLER_STORE",
                 userData: { scrappedItem, sellerBaseUrl: cleaned }
             }]);
+            phase('SELLER_HUB handler done (enqueued SELLER_STORE)');
         } catch (err) {
             log.error(`SELLER_HUB failed`, { url: request.url, error: err.message });
             throw err;
@@ -790,12 +865,16 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_with_seller'];
 
     // ──────────────────── SELLER_STORE ────────────────────
     crawler.router.addHandler("SELLER_STORE", async ({ page, request, log }) => {
+        const phase = makePhaseLogger(log, 'SELLER_STORE');
+        phase('handler start');
+
         const scrappedItem = request.userData.scrappedItem;
         const sellerBaseUrl = request.userData.sellerBaseUrl;
         try {
             await page.waitForSelector('article.str-item-card', { timeout: 15000 }).catch(() => {
                 log.warning(`SELLER_STORE: No store items found on Shop tab`, { url: request.url });
             });
+            phase('store items DOM ready');
 
             const rawItems = await page.evaluate(() => {
                 const items = [];
@@ -824,6 +903,7 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_with_seller'];
                 return { name: item.name, imageUrl: item.imageUrl, currency, priceMin, priceMax, url: item.url };
             });
             log.info(`Scraped ${scrappedItem.seller.storeItems.length} store items`);
+            phase('store items extracted');
 
             const feedbackClicked = await page.evaluate(() => {
                 const tabs = document.querySelectorAll('[role="tab"]');
@@ -839,6 +919,7 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_with_seller'];
             } else {
                 log.warning(`SELLER_STORE: Feedback tab not found`, { url: request.url });
             }
+            phase('feedback tab loaded');
 
             const { summary, detailedRatings, totalSellerFeedbackCount, displayName, ebayUsername, storeId, feedbackScore, positivePercent, itemsSold, followers, feedbackLinks, logoUrl } = await page.evaluate(() => {
                 const summary = { positive: null, neutral: null, negative: null };
@@ -1019,6 +1100,7 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_with_seller'];
                 return { scriptBlocks: scriptBlocks.length, jsonState, dataAttributes, trackingIds: { googleAnalytics, facebookPixel }, jsBundles, cssBundles };
             });
             scrappedItem.sellerTechnical = sellerTechnical;
+            phase('seller data + technical extracted');
 
             const aboutClicked = await page.evaluate(() => {
                 const tabs = document.querySelectorAll('[role="tab"]');
@@ -1052,6 +1134,7 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_with_seller'];
                 memberSince: aboutData.sellerInfoMap['member since'] || null,
                 businessDetails: Object.keys(aboutData.businessDetails).length ? aboutData.businessDetails : null
             };
+            phase('about tab extracted');
 
             if (feedbackLinks.negative || feedbackLinks.positive) {
                 const primary = feedbackLinks.negative || feedbackLinks.positive;
@@ -1068,6 +1151,7 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_with_seller'];
                 log.warning('No seller feedback link found, pushing data');
                 await Dataset.pushData(scrappedItem);
             }
+            phase('SELLER_STORE handler done');
         } catch (err) {
             log.error(`SELLER_STORE failed`, { url: request.url, error: err.message });
             throw err;
@@ -1078,6 +1162,9 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_with_seller'];
     // Scrape seller negative + positive review samples in parallel on two pages
     // sharing the same browser context.
     crawler.router.addHandler("SELLER_REVIEWS", async ({ page, request, log }) => {
+        const phase = makePhaseLogger(log, 'SELLER_REVIEWS');
+        phase('handler start');
+
         const scrappedItem = request.userData.scrappedItem;
         const { negativeUrl, positiveUrl } = request.userData;
 
@@ -1165,6 +1252,7 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_with_seller'];
                 );
             }
             const [primarySamples, secondarySamples = []] = await Promise.all(tasks);
+            phase('parallel review pages scraped');
 
             const negativeSamples = primaryIsNegative ? primarySamples : secondarySamples;
             const positiveSamples = primaryIsNegative ? secondarySamples : primarySamples;
@@ -1174,6 +1262,7 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_with_seller'];
             log.info(`SELLER_REVIEWS: negative=${negativeSamples.length}, positive=${positiveSamples.length}`);
 
             await Dataset.pushData(scrappedItem);
+            phase('SELLER_REVIEWS handler done (data pushed)');
         } finally {
             if (secondaryPage) await secondaryPage.close().catch(() => {});
         }

@@ -22,6 +22,12 @@
             },
             "default": ["https://www.ebay.com/itm/123456789"],
             "prefill": ["https://www.ebay.com/itm/123456789"]
+        },
+        "extractShippingOptions": {
+            "title": "Extract Shipping Options (US)",
+            "type": "boolean",
+            "description": "When enabled, the scraper clicks the shipping widget and selects 'United States' to extract shipping cost & delivery estimates. Adds ~3 seconds per item. Disabled by default.",
+            "default": false
         }
     },
     "required": ["startUrls"]
