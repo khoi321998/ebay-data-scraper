@@ -1,0 +1,34 @@
+{
+    "name": "ebay-scraper-actor",
+    "version": "0.0.1",
+    "type": "module",
+    "description": "Apify Actor for scraping eBay product and seller data with optimized performance using Cheerio and Playwright crawlers.",
+    "engines": {
+        "node": ">=18.0.0"
+    },
+    "dependencies": {
+        "apify": "^3.7.0",
+        "cheerio": "^1.2.0",
+        "crawlee": "^3.15.3",
+        "dotenv": "^16.4.5",
+        "i18n-iso-countries": "^7.12.0",
+        "playwright": "^1.59.1"
+    },
+    "devDependencies": {
+        "@apify/eslint-config": "^2.0.0",
+        "eslint": "^9.29.0",
+        "eslint-config-prettier": "^10.1.5",
+        "prettier": "^3.5.3",
+        "vitest": "^4.1.0"
+    },
+    "scripts": {
+        "start": "node src/main.js",
+        "format": "prettier --write .",
+        "format:check": "prettier --check .",
+        "lint": "eslint",
+        "lint:fix": "eslint --fix",
+        "test": "vitest run"
+    },
+    "author": "Senior Apify Developer",
+    "license": "ISC"
+}

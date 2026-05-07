@@ -1,0 +1,93 @@
+{
+    "actorSpecification": 1,
+    "fields": {},
+    "views": {
+        "overview": {
+            "title": "Overview",
+            "transformation": {
+                "fields": [
+                    "platform",
+                    "url",
+                    "capturedAt",
+                    "captureMode",
+                    "product.title",
+                    "product.brand",
+                    "product.pricing.price",
+                    "product.pricing.currency",
+                    "product.stock.availableQuantity",
+                    "product.reviewsSummary.rating",
+                    "product.reviewsSummary.reviewCount",
+                    "seller.displayName",
+                    "seller.ebayUsername",
+                    "seller.feedbackScore",
+                    "seller.positivePercent"
+                ]
+            },
+            "display": {
+                "component": "table",
+                "properties": {
+                    "platform": {
+                        "label": "Platform",
+                        "format": "text"
+                    },
+                    "url": {
+                        "label": "URL",
+                        "format": "link"
+                    },
+                    "capturedAt": {
+                        "label": "Captured At",
+                        "format": "date"
+                    },
+                    "captureMode": {
+                        "label": "Mode",
+                        "format": "text"
+                    },
+                    "product.title": {
+                        "label": "Product Title",
+                        "format": "text"
+                    },
+                    "product.brand": {
+                        "label": "Brand",
+                        "format": "text"
+                    },
+                    "product.pricing.price": {
+                        "label": "Price",
+                        "format": "number"
+                    },
+                    "product.pricing.currency": {
+                        "label": "Currency",
+                        "format": "text"
+                    },
+                    "product.stock.availableQuantity": {
+                        "label": "Available Qty",
+                        "format": "number"
+                    },
+                    "product.reviewsSummary.rating": {
+                        "label": "Rating",
+                        "format": "number"
+                    },
+                    "product.reviewsSummary.reviewCount": {
+                        "label": "Review Count",
+                        "format": "number"
+                    },
+                    "seller.displayName": {
+                        "label": "Seller Name",
+                        "format": "text"
+                    },
+                    "seller.ebayUsername": {
+                        "label": "Seller Username",
+                        "format": "text"
+                    },
+                    "seller.feedbackScore": {
+                        "label": "Seller Score",
+                        "format": "number"
+                    },
+                    "seller.positivePercent": {
+                        "label": "Positive %",
+                        "format": "number"
+                    }
+                }
+            }
+        }
+    }
+}

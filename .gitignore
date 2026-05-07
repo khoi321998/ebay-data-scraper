@@ -1,43 +1,10 @@
-# Dependencies
-node_modules/
+# This file tells Git which files shouldn't be added to source control
 
-# Logs
-logs
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-
-# Environment variables
-.env
-.env.*
-
-# Apify
-storage/
-apify_storage/
-
-# Build output
-dist/
-build/
-
-# OS files
 .DS_Store
-Thumbs.db
-
-# IDE
-.vscode/
-.idea/
-
-# Temp
-tmp/
-temp/
-
-# Coverage
-coverage/
-
-# Playwright
-playwright-report/
-test-results/
-
-# Cache
-.cache/
+.idea
+.vscode
+.zed
+dist
+node_modules
+apify_storage
+storage

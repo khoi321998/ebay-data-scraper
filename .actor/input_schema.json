@@ -1,0 +1,28 @@
+{
+    "title": "eBay Scraper Input",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "mode": {
+            "title": "Scraping Mode",
+            "type": "string",
+            "description": "Choose the scraping mode: product_only (items only), seller_only (sellers only), or product_with_seller (both)",
+            "enum": ["product_only", "seller_only", "product_with_seller"],
+            "default": "product_with_seller",
+            "enumTitles": ["Product Only", "Seller Only", "Product with Seller"]
+        },
+        "startUrls": {
+            "title": "Start URLs",
+            "type": "array",
+            "description": "URLs to start scraping from. For product modes, use item URLs (e.g., https://www.ebay.com/itm/...). For seller_only, use seller store/profile URLs (e.g., https://www.ebay.com/str/... or https://www.ebay.com/usr/...).",
+            "editor": "stringList",
+            "items": {
+                "type": "string",
+                "pattern": "^https?://"
+            },
+            "default": ["https://www.ebay.com/itm/123456789"],
+            "prefill": ["https://www.ebay.com/itm/123456789"]
+        }
+    },
+    "required": ["startUrls"]
+}
