@@ -573,8 +573,8 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_with_seller'];
             captureMode: mode,
             product: {
                 id: {
-                    platformItemId, legacyItemId: null, skuIds: [],
-                    otherIds: { mpn, modelNumber, ean, upc, gtin, internal: {} }
+                    platformItemId,
+                    otherIds: { mpn, modelNumber, ean, upc, gtin }
                 },
                 title, brand,
                 category: { breadcrumb, leafCategoryName, leafCategoryId, categoryPathIds },
