@@ -618,29 +618,20 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_with_seller'];
             scrappedItem.seller.ebayUsername = ebayUsername;
         }
 
-        const feedbackUrls = await page.evaluate(async () => {
+        const feedbackUrls = await page.evaluate(() => {
             // The feedback module has two tabs ("This item" / "All items"), each
-            // with its own filter dropdown. The default-selected tab varies per
-            // visit, so explicitly click "This item" before reading URLs.
+            // with its own filter dropdown pre-rendered in the DOM. Scope to the
+            // "This item" panel so we don't pick up "All items" URLs.
             const tabs = document.querySelectorAll('.fdbk-detail-list [role="tab"]');
-            let thisItemTab = null;
+            let panel = null;
             for (const tab of tabs) {
                 if (/^This item/i.test(tab.textContent?.trim() || '')) {
-                    thisItemTab = tab;
+                    const panelId = tab.getAttribute('aria-controls');
+                    if (panelId) panel = document.getElementById(panelId);
                     break;
                 }
             }
-            if (thisItemTab && thisItemTab.getAttribute('aria-selected') !== 'true') {
-                thisItemTab.click();
-                await new Promise(r => setTimeout(r, 300));
-            }
-
-            // Scope the dropdown lookup to the "This item" tabpanel only so we
-            // don't pick up URLs from the "All items" panel.
-            const panelId = thisItemTab?.getAttribute('aria-controls');
-            const panel = panelId ? document.getElementById(panelId) : null;
             const scope = panel || document;
-
             const options = scope.querySelectorAll('select[name="feedbackFilterDropdown"] option');
             const urls = { negative: null, positive: null };
             options.forEach(opt => {
@@ -698,31 +689,16 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_with_seller'];
         const scrappedItem = request.userData.scrappedItem;
         const { negativeUrl, positiveUrl } = request.userData;
 
+        // eBay renders both "This item" and "All items" tabpanels in the DOM
+        // (the inactive one only has `hidden=""`), so unscoped selectors mix
+        // them. Each evaluate below scopes to the "This item" panel by tab text.
         const scrapeSamples = async (p, label) => {
             try {
-                // Make sure the "This item" tab is active before reading cards.
-                // eBay renders both tabpanels in the DOM (the inactive one only
-                // has `hidden=""`), so an unscoped querySelector mixes them.
-                await p.evaluate(async () => {
-                    const tabs = document.querySelectorAll('[role="tab"]');
-                    let thisItemTab = null;
-                    for (const tab of tabs) {
-                        if (/^This item/i.test(tab.textContent?.trim() || '')) {
-                            thisItemTab = tab;
-                            break;
-                        }
-                    }
-                    if (thisItemTab && thisItemTab.getAttribute('aria-selected') !== 'true') {
-                        thisItemTab.click();
-                        await new Promise(r => setTimeout(r, 300));
-                    }
-                });
-
                 await p.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
                 await p.waitForFunction(() => {
-                    const activeTab = document.querySelector('[role="tab"][aria-selected="true"]');
-                    const panelId = activeTab?.getAttribute('aria-controls');
-                    const panel = panelId ? document.getElementById(panelId) : document;
+                    const tab = [...document.querySelectorAll('[role="tab"]')]
+                        .find(t => /^This item/i.test(t.textContent?.trim() || ''));
+                    const panel = tab && document.getElementById(tab.getAttribute('aria-controls')) || document;
                     if (panel.querySelector('.fdbk-result-status')) return true;
                     const cards = panel.querySelectorAll('li.fdbk-container[data-testid="feedback-cards"]');
                     if (cards.length === 0) return false;
@@ -731,9 +707,9 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_with_seller'];
                     log.warning(`${label}: Expected content not found`, { url: p.url() });
                 });
                 return await p.evaluate(() => {
-                    const activeTab = document.querySelector('[role="tab"][aria-selected="true"]');
-                    const panelId = activeTab?.getAttribute('aria-controls');
-                    const panel = panelId ? document.getElementById(panelId) : document;
+                    const tab = [...document.querySelectorAll('[role="tab"]')]
+                        .find(t => /^This item/i.test(t.textContent?.trim() || ''));
+                    const panel = tab && document.getElementById(tab.getAttribute('aria-controls')) || document;
                     const cards = panel.querySelectorAll('li.fdbk-container[data-testid="feedback-cards"]');
                     const results = [];
                     cards.forEach((card, i) => {
