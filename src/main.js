@@ -643,6 +643,8 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_with_seller'];
         }
         phase('description awaited (parallel got)');
 
+        log.info(`ITEM feedbackUrls: negative=${feedbackUrls?.negative} | positive=${feedbackUrls?.positive}`);
+
         // Enqueue ITEM_REVIEWS directly (DESCRIPTION queue round-trip removed)
         if (feedbackUrls?.negative || feedbackUrls?.positive) {
             // Primary URL drives Crawlee navigation; the other is opened on a second
