@@ -618,8 +618,30 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_with_seller'];
             scrappedItem.seller.ebayUsername = ebayUsername;
         }
 
-        const feedbackUrls = await page.evaluate(() => {
-            const options = document.querySelectorAll('select[name="feedbackFilterDropdown"] option');
+        const feedbackUrls = await page.evaluate(async () => {
+            // The feedback module has two tabs ("This item" / "All items"), each
+            // with its own filter dropdown. The default-selected tab varies per
+            // visit, so explicitly click "This item" before reading URLs.
+            const tabs = document.querySelectorAll('.fdbk-detail-list [role="tab"]');
+            let thisItemTab = null;
+            for (const tab of tabs) {
+                if (/^This item/i.test(tab.textContent?.trim() || '')) {
+                    thisItemTab = tab;
+                    break;
+                }
+            }
+            if (thisItemTab && thisItemTab.getAttribute('aria-selected') !== 'true') {
+                thisItemTab.click();
+                await new Promise(r => setTimeout(r, 300));
+            }
+
+            // Scope the dropdown lookup to the "This item" tabpanel only so we
+            // don't pick up URLs from the "All items" panel.
+            const panelId = thisItemTab?.getAttribute('aria-controls');
+            const panel = panelId ? document.getElementById(panelId) : null;
+            const scope = panel || document;
+
+            const options = scope.querySelectorAll('select[name="feedbackFilterDropdown"] option');
             const urls = { negative: null, positive: null };
             options.forEach(opt => {
                 const val = opt.value || '';
@@ -678,17 +700,41 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_with_seller'];
 
         const scrapeSamples = async (p, label) => {
             try {
+                // Make sure the "This item" tab is active before reading cards.
+                // eBay renders both tabpanels in the DOM (the inactive one only
+                // has `hidden=""`), so an unscoped querySelector mixes them.
+                await p.evaluate(async () => {
+                    const tabs = document.querySelectorAll('[role="tab"]');
+                    let thisItemTab = null;
+                    for (const tab of tabs) {
+                        if (/^This item/i.test(tab.textContent?.trim() || '')) {
+                            thisItemTab = tab;
+                            break;
+                        }
+                    }
+                    if (thisItemTab && thisItemTab.getAttribute('aria-selected') !== 'true') {
+                        thisItemTab.click();
+                        await new Promise(r => setTimeout(r, 300));
+                    }
+                });
+
                 await p.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
                 await p.waitForFunction(() => {
-                    if (document.querySelector('.fdbk-result-status')) return true;
-                    const cards = document.querySelectorAll('li.fdbk-container[data-testid="feedback-cards"]');
+                    const activeTab = document.querySelector('[role="tab"][aria-selected="true"]');
+                    const panelId = activeTab?.getAttribute('aria-controls');
+                    const panel = panelId ? document.getElementById(panelId) : document;
+                    if (panel.querySelector('.fdbk-result-status')) return true;
+                    const cards = panel.querySelectorAll('li.fdbk-container[data-testid="feedback-cards"]');
                     if (cards.length === 0) return false;
                     return cards[0].querySelector('.fdbk-container__details__comment span')?.textContent?.trim()?.length > 0;
                 }, { timeout: 20000 }).catch(() => {
                     log.warning(`${label}: Expected content not found`, { url: p.url() });
                 });
                 return await p.evaluate(() => {
-                    const cards = document.querySelectorAll('li.fdbk-container[data-testid="feedback-cards"]');
+                    const activeTab = document.querySelector('[role="tab"][aria-selected="true"]');
+                    const panelId = activeTab?.getAttribute('aria-controls');
+                    const panel = panelId ? document.getElementById(panelId) : document;
+                    const cards = panel.querySelectorAll('li.fdbk-container[data-testid="feedback-cards"]');
                     const results = [];
                     cards.forEach((card, i) => {
                         if (i >= 5) return;
