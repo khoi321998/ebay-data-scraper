@@ -531,15 +531,20 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_with_seller'];
 
         phase('shipping block done');
 
-        // Pick the inner div matching "Estimated between <date> and <date>" inside the deliverto block.
+        // Pick the first inner div ("Estimated between <date> and <date>") inside the deliverto values content.
+        // Must target the leaf div directly — selecting all descendants would also match ancestor divs whose
+        // text concatenates the sibling "Ships today..." div.
         let deliveryTimeText = null;
-        $after('div.ux-labels-values--deliverto div').each((_, el) => {
-            const text = $after(el).clone().find('.ux-textspans__custom-view').remove().end().text().trim().replace(/\s+/g, ' ');
+        const deliveryDateDiv = $after('div.ux-labels-values--deliverto .ux-labels-values__values-content > div').first();
+        if (deliveryDateDiv.length) {
+            const text = deliveryDateDiv.clone()
+                .find('.ux-textspans__custom-view').remove()
+                .end()
+                .text().trim().replace(/\s+/g, ' ');
             if (/^Estimated between\s/i.test(text)) {
                 deliveryTimeText = text.replace(/\s+to\s+\d{4,5}(?:-\d{4})?\s*$/i, '');
-                return false;
             }
-        });
+        }
 
         const scrappedItem = {
             platform: "ebay",
