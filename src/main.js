@@ -102,12 +102,10 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_with_seller'];
 
     let mode = 'product_with_seller';
     let inputUrls = [];
-    let extractShippingOptions = false;
     try {
         const input = await Actor.getInput();
         mode = input?.mode || 'product_with_seller';
         inputUrls = input?.startUrls || input?.productUrls || input?.sellerUrls || [];
-        extractShippingOptions = input?.extractShippingOptions === true;
     } catch (err) {
         console.error("Failed to read input:", err);
         return;
@@ -491,77 +489,54 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_with_seller'];
         phase('tracking IDs + bundles extracted');
 
         const shippingOptions = [];
-        if (extractShippingOptions) {
-            const shippingButton = await page.$('div.ux-labels-values--shipping button span');
-            const isShippingButtonVisible = shippingButton
-                ? await shippingButton.isVisible().catch(() => false)
-                : false;
-            if (shippingButton && isShippingButtonVisible) {
-                await shippingButton.scrollIntoViewIfNeeded().catch(() => {});
-                await shippingButton.evaluate(el => el.click());
-                // Wait up to 10s for the country dropdown; skip the whole block if it never renders.
-                const countrySelect = await page.waitForSelector('#shCountry', { timeout: 10000 }).catch(() => null);
-                if (countrySelect) {
-                    // Pick US explicitly. Previously the loop took the first option with a value,
-                    // which was alphabetically "American Samoa" (value="7") — incorrect for shipping cost.
-                    let selectedLabel = null;
-                    try {
-                        await countrySelect.selectOption({ label: 'United States' });
-                        selectedLabel = 'United States';
-                    } catch (_) {
-                        // Fallback: search options for one matching US
-                        const options = await countrySelect.$$('option');
-                        for (const option of options) {
-                            const label = (await option.textContent())?.trim() || '';
-                            if (/^(united states|usa|us)$/i.test(label)) {
-                                const value = await option.getAttribute('value');
-                                if (value) {
-                                    await countrySelect.selectOption(value);
-                                    selectedLabel = label;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    log.info(`ITEM: shipping country selected`, { label: selectedLabel });
-                    await page.click('button:has-text("Update")').catch(() => {});
-                    await page.locator('div.ux-labels-values--deliveryto span.ux-textspans--BOLD').first().waitFor({ state: 'visible', timeout: 10000 }).catch(() => {});
-                    const selector = await parseWithCheerio();
-                    const boldSpans = selector('div.ux-labels-values--deliveryto span[class="ux-textspans ux-textspans--BOLD"]');
-                    const shippingPrice = selector('div.ux-labels-values--deliveryto > div.ux-labels-values__values > div > div:nth-child(3)').text().trim();
-                    let shipPrice = 0, shipCurrency = "USD";
-                    const parsed = parseCurrency(shippingPrice);
-                    if (parsed) { shipPrice = parsed.cost; shipCurrency = parsed.currency; }
-                    if (boldSpans.length > 0) {
-                        shippingOptions.push({
-                            name: selector(boldSpans[0]).text().trim(),
-                            cost: shipPrice,
-                            currency: shipCurrency,
-                            estimatedDeliveryMinDays: getEstimatedDaysLeft(selector(boldSpans[1]).text().trim()),
-                            estimatedDeliveryMaxDays: getEstimatedDaysLeft(selector(boldSpans[2]).text().trim())
-                        });
-                    }
-                } else {
-                    log.warning('ITEM: shipping country dropdown did not render, skipping shipping options');
-                }
+
+        await page.waitForSelector('div.ux-labels-values--deliverto .ux-labels-values__values-content', { timeout: 3000 })
+            .catch(() => {});
+        page.off('request', requestTracker);
+
+        const $after = await parseWithCheerio();
+
+        // Extract shipping cost + method directly from the page DOM (no modal click).
+        const shippingValuesFirstDiv = $after('div.ux-labels-values--shipping div.ux-labels-values__values-content > div').first();
+        const deliveryBolds = $after('div.ux-labels-values--deliverto span.ux-textspans--BOLD');
+        if (shippingValuesFirstDiv.length) {
+            const costText = shippingValuesFirstDiv.find('span.ux-textspans--BOLD').first().text().trim();
+            const methodText = shippingValuesFirstDiv.clone()
+                .find('span.ux-textspans--BOLD, span.ux-textspans--SUPERSCRIPT, button').remove()
+                .end()
+                .text()
+                .replace(/\s+/g, ' ')
+                .trim()
+                .replace(/\.\s*$/, '');
+
+            let shipCost = 0, shipCurrency = "USD";
+            if (costText && !/^free$/i.test(costText)) {
+                const parsed = parseCurrency(costText);
+                if (parsed) { shipCost = parsed.cost; shipCurrency = parsed.currency; }
+            }
+
+            const minDays = deliveryBolds.length >= 1 ? getEstimatedDaysLeft($after(deliveryBolds[0]).text().trim()) : null;
+            const maxDays = deliveryBolds.length >= 2 ? getEstimatedDaysLeft($after(deliveryBolds[1]).text().trim()) : null;
+
+            if (costText || methodText) {
+                shippingOptions.push({
+                    name: methodText,
+                    cost: shipCost,
+                    currency: shipCurrency,
+                    estimatedDeliveryMinDays: minDays,
+                    estimatedDeliveryMaxDays: maxDays
+                });
             }
         }
 
         phase('shipping block done');
 
-        // Wait for the delivery-to block to materialize if it exists. Skip the wait
-        // entirely when the element isn't on the page to save ~10s.
-        await page.waitForSelector('div.ux-labels-values--deliveryto .ux-labels-values__values-content', { timeout: 3000 })
-            .catch(() => {});
-        page.off('request', requestTracker);
-
-        const $after = await parseWithCheerio();
-        // Pick the inner div matching "Estimated between <date> and <date>" inside the deliveryto block.
+        // Pick the inner div matching "Estimated between <date> and <date>" inside the deliverto block.
         let deliveryTimeText = null;
-        $after('div.ux-labels-values--deliveryto div').each((_, el) => {
+        $after('div.ux-labels-values--deliverto div').each((_, el) => {
             const text = $after(el).clone().find('.ux-textspans__custom-view').remove().end().text().trim().replace(/\s+/g, ' ');
             if (/^Estimated between\s/i.test(text)) {
-                deliveryTimeText = text;
+                deliveryTimeText = text.replace(/\s+to\s+\d{4,5}(?:-\d{4})?\s*$/i, '');
                 return false;
             }
         });
