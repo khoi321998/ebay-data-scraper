@@ -415,11 +415,11 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_with_seller'];
 
         const mediaRegex = /"_type"\s*:\s*"VIImageType"[\s\S]*?"thumbnail"\s*:\s*\{[\s\S]*?"title"\s*:\s*"([^"]+)"[\s\S]*?"imageId"\s*:\s*"([^"]+)"[\s\S]*?"URL"\s*:\s*"([^"]+)"/g;
         const mediaMatches = [...scriptContent.matchAll(mediaRegex)];
-        const images = mediaMatches.map((m, i) => {
+        const images = mediaMatches.map((m) => {
             const url = m[3].replace("s-l140.webp", "s-l960.webp");
             const alt = m[1];
             if (!alt.toLowerCase().includes("video")) {
-                return { url, variantKey: m[2], isMain: (i === 0) };
+                return { url };
             }
         }).filter(Boolean);
 
@@ -552,26 +552,18 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_with_seller'];
             capturedAt: new Date().toISOString(),
             captureMode: mode,
             product: {
-                id: {
-                    platformItemId,
-                    otherIds: { mpn, modelNumber, ean, upc, gtin }
-                },
+                id: platformItemId,
                 title, brand,
-                category: { breadcrumb, leafCategoryName, leafCategoryId, categoryPathIds },
                 pricing: { currency, price: priceMin, priceMin, priceMax },
                 stock: { availableQuantity, soldCount },
-                condition: { conditionText, returnPolicySummary, guaranteeLabels: [], authenticityClaims: [] },
-                origin: { itemLocationText, itemCountryCode, shipsFromLocations: [], warehouseCountryCodes: [] },
-                shipping: { options: shippingOptions, deliveryTimeText },
+                shipping: { deliveryTimeText },
                 paymentMethods,
                 description: { html: null, plainText: null },
                 specifications,
                 media: { images, videos: [] },
                 reviewsSummary: {
                     rating, reviewCount, ratingBreakdown,
-                    negativeReviewSamples: [], positiveReviewSamples: [],
-                    authenticityKeywords: [],
-                    buyerMediaCounts: { images: 0, videos: 0 }
+                    negativeReviewSamples: [], positiveReviewSamples: []
                 }
             },
             sellerRef: mode === 'product_only' ? null : { platformSellerId, displayName, ebayUsername },
