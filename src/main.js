@@ -1,14 +1,14 @@
 /*
 Unified eBay scraper supporting three modes.
 Input: {
-  "mode": "product_only" | "seller_only" | "product_with_seller",
+  "mode": "product_only" | "seller_only" | "product_and_seller",
   "startUrls": [ "<url>", ... ]
 }
 
 Flows:
   product_only         ITEM → DESCRIPTION → ITEM_REVIEWS (negative ∥ positive) → pushData
   seller_only          (SELLER_HUB if hub URL →) SELLER_STORE → SELLER_REVIEWS (negative ∥ positive) → pushData
-  product_with_seller  ITEM → DESCRIPTION → ITEM_REVIEWS (negative ∥ positive)
+  product_and_seller   ITEM → DESCRIPTION → ITEM_REVIEWS (negative ∥ positive)
                         → (SELLER_HUB →) SELLER_STORE → SELLER_REVIEWS (negative ∥ positive) → pushData
 
 Response shape is stable across modes. Fields not applicable to a given mode are null:
@@ -95,16 +95,16 @@ function emptySellerSection() {
     };
 }
 
-const VALID_MODES = ['product_only', 'seller_only', 'product_with_seller'];
+const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
 
 (async () => {
     await Actor.init();
 
-    let mode = 'product_with_seller';
+    let mode = 'product_and_seller';
     let inputUrls = [];
     try {
         const input = await Actor.getInput();
-        mode = input?.mode || 'product_with_seller';
+        mode = input?.mode || 'product_and_seller';
         inputUrls = input?.startUrls || input?.productUrls || input?.sellerUrls || [];
     } catch (err) {
         console.error("Failed to read input:", err);
@@ -148,7 +148,7 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_with_seller'];
             };
         });
     } else {
-        // product_only and product_with_seller both start at ITEM
+        // product_only and product_and_seller both start at ITEM
         startUrls = inputUrls.map(url => ({
             url: `${url}?rt=nc&_ipg=1&location=US`,
             label: 'ITEM',

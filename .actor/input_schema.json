@@ -6,10 +6,10 @@
         "mode": {
             "title": "Scraping Mode",
             "type": "string",
-            "description": "Choose the scraping mode: product_only (items only), seller_only (sellers only), or product_with_seller (both)",
-            "enum": ["product_only", "seller_only", "product_with_seller"],
-            "default": "product_with_seller",
-            "enumTitles": ["Product Only", "Seller Only", "Product with Seller"]
+            "description": "Choose the scraping mode: product_only (items only), seller_only (sellers only), or product_and_seller (both)",
+            "enum": ["product_only", "seller_only", "product_and_seller"],
+            "default": "product_and_seller",
+            "enumTitles": ["Product Only", "Seller Only", "Product and Seller"]
         },
         "startUrls": {
             "title": "Start URLs",

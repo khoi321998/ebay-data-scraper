@@ -14,7 +14,7 @@ import { CheerioCrawler, Dataset } from "crawlee";
 import { Actor } from "apify";
 import "dotenv/config";
 
-const VALID_MODES = ["product_only", "seller_only", "product_with_seller"];
+const VALID_MODES = ["product_only", "seller_only", "product_and_seller"];
 
 function parseCurrency(input) {
     if (!input) return null;
@@ -37,7 +37,7 @@ function parseCurrency(input) {
     await Actor.init();
 
     const input = await Actor.getInput();
-    const mode = input?.mode || "product_with_seller";
+    const mode = input?.mode || "product_and_seller";
     const inputUrls = input?.startUrls || input?.productUrls || input?.sellerUrls || [];
 
     if (!VALID_MODES.includes(mode)) {
@@ -242,8 +242,8 @@ function parseCurrency(input) {
         itemsPushed++;
         await Dataset.pushData(item);
 
-        // For product_with_seller: chain to seller page if we have a URL
-        if (mode === "product_with_seller" && sellerProfileUrl) {
+        // For product_and_seller: chain to seller page if we have a URL
+        if (mode === "product_and_seller" && sellerProfileUrl) {
             try {
                 const absUrl = new URL(sellerProfileUrl, "https://www.ebay.com").toString().replace(/\/+$/, "");
                 const isHub =
@@ -390,7 +390,7 @@ function parseCurrency(input) {
             itemsPushed++;
             await Dataset.pushData(sellerData);
         }
-        // For product_with_seller, the ITEM record was already pushed; we only
+        // For product_and_seller, the ITEM record was already pushed; we only
         // log seller fields here — extending the ITEM record across requests
         // would require a shared store, which is out of scope for the benchmark.
     });
