@@ -554,7 +554,7 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_with_seller'];
             product: {
                 id: platformItemId,
                 title, brand,
-                pricing: { currency, price: priceMin, priceMin, priceMax },
+                pricing: { currency, priceMin, priceMax },
                 stock: { availableQuantity, soldCount },
                 shipping: { deliveryTimeText },
                 paymentMethods,

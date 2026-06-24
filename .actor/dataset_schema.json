@@ -12,7 +12,8 @@
                     "captureMode",
                     "product.title",
                     "product.brand",
-                    "product.pricing.price",
+                    "product.pricing.priceMin",
+                    "product.pricing.priceMax",
                     "product.pricing.currency",
                     "product.stock.availableQuantity",
                     "product.reviewsSummary.rating",
@@ -50,8 +51,12 @@
                         "label": "Brand",
                         "format": "text"
                     },
-                    "product.pricing.price": {
-                        "label": "Price",
+                    "product.pricing.priceMin": {
+                        "label": "Price Min",
+                        "format": "number"
+                    },
+                    "product.pricing.priceMax": {
+                        "label": "Price Max",
                         "format": "number"
                     },
                     "product.pricing.currency": {
