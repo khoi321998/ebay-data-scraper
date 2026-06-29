@@ -26,7 +26,7 @@ This Apify Actor provides **high-performance scraping** of eBay listings and sel
 1. **Choose your scraping mode**:
    - `product_only`: Scrape product details and reviews only
    - `seller_only`: Scrape seller profiles and feedback only
-   - `product_with_seller`: Get complete product and seller data
+   - `product_and_seller`: Get complete product and seller data
 
 2. **Provide start URLs**:
    - For product modes: Use eBay item URLs (e.g., `https://www.ebay.com/itm/123456789`)
@@ -42,7 +42,7 @@ This Apify Actor provides **high-performance scraping** of eBay listings and sel
 
 The Actor accepts the following input parameters:
 
-- **mode**: Scraping mode (`product_only`, `seller_only`, `product_with_seller`)
+- **mode**: Scraping mode (`product_only`, `seller_only`, `product_and_seller`)
 - **startUrls**: Array of URLs to start scraping from
 - **maxRequestsPerCrawl**: Maximum number of pages to scrape (default: 1000)
 - **proxyConfiguration**: Proxy settings for anti-bot protection
@@ -62,7 +62,7 @@ The Actor outputs structured JSON objects containing:
   "platform": "ebay",
   "url": "https://www.ebay.com/itm/123456789",
   "capturedAt": "2024-01-15T10:30:00.000Z",
-  "captureMode": "product_with_seller",
+  "captureMode": "product_and_seller",
   "product": {
     "title": "Sample Product Title",
     "brand": "Brand Name",

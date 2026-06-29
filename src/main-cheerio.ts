@@ -10,15 +10,18 @@ Trade-off vs main.js:
 
 Usage: `node src/main-cheerio.js`  (or add npm script)
 */
-import { CheerioCrawler, Dataset } from "crawlee";
-import { Actor } from "apify";
 import "dotenv/config";
+
+import { Actor } from "apify";
+import { CheerioCrawler, Dataset } from "crawlee";
+
+import type { ActorInput, CaptureMode, ParsedCurrency, Specification } from "./dto/index.js";
 
 const VALID_MODES = ["product_only", "seller_only", "product_and_seller"];
 
-function parseCurrency(input) {
+function parseCurrency(input: string | null | undefined): ParsedCurrency | null {
     if (!input) return null;
-    const currencyMap = { "$": "USD", "€": "EUR", "£": "GBP", "¥": "JPY", "₹": "INR" };
+    const currencyMap: Record<string, string> = { "$": "USD", "€": "EUR", "£": "GBP", "¥": "JPY", "₹": "INR" };
     const symbolMatch = input.match(/([$€£¥₹])\s*([\d,]+(?:\.\d+)?)/);
     if (symbolMatch) {
         return {
@@ -33,11 +36,11 @@ function parseCurrency(input) {
     return null;
 }
 
-(async () => {
+void (async () => {
     await Actor.init();
 
-    const input = await Actor.getInput();
-    const mode = input?.mode || "product_and_seller";
+    const input = await Actor.getInput<ActorInput>();
+    const mode: CaptureMode = input?.mode || "product_and_seller";
     const inputUrls = input?.startUrls || input?.productUrls || input?.sellerUrls || [];
 
     if (!VALID_MODES.includes(mode)) {
@@ -77,7 +80,7 @@ function parseCurrency(input) {
     // ─── perf instrumentation ───
     const benchStart = Date.now();
     let itemsPushed = 0;
-    const handlerTimes = [];
+    const handlerTimes: { label: string; ms: number }[] = [];
 
     const crawler = new CheerioCrawler({
         proxyConfiguration,
@@ -112,7 +115,7 @@ function parseCurrency(input) {
                         });
                         log.info(`[cheerio] warmup status=${res.statusCode} cookies=${(session.getCookieString?.("https://www.ebay.com") || "").length}b`);
                     } catch (e) {
-                        log.warning(`[cheerio] warm-up failed: ${e.message}`);
+                        log.warning(`[cheerio] warm-up failed: ${(e as Error).message}`);
                     }
                 }
             },
@@ -141,9 +144,9 @@ function parseCurrency(input) {
         const ean = $("dl.ux-labels-values--ean dd.ux-labels-values__values span.ux-textspans").text().trim() || null;
         const gtin = upc || ean || null;
 
-        const rawPriceTexts = [];
-        $("div.x-price-primary span.ux-textspans").each((_i, el) => rawPriceTexts.push($(el).text().trim()));
-        const prices = [];
+        const rawPriceTexts: string[] = [];
+        $("div.x-price-primary span.ux-textspans").each((_i, el) => { rawPriceTexts.push($(el).text().trim()); });
+        const prices: ParsedCurrency[] = [];
         rawPriceTexts.forEach((text) => {
             text.split(/\s+to\s+/i).forEach((part) => {
                 const parsed = parseCurrency(part);
@@ -155,8 +158,8 @@ function parseCurrency(input) {
         const priceMax = priceValues.length ? Math.max(...priceValues) : null;
         const currency = prices[0]?.currency || null;
 
-        const breadcrumb = [];
-        $("a.seo-breadcrumb-text").each((_i, el) => breadcrumb.push($(el).find("span").text().trim()));
+        const breadcrumb: string[] = [];
+        $("a.seo-breadcrumb-text").each((_i, el) => { breadcrumb.push($(el).find("span").text().trim()); });
 
         const conditionText = $("div.x-item-condition-text span.ux-textspans").first().text().trim() || null;
 
@@ -176,7 +179,7 @@ function parseCurrency(input) {
         const itemLocationText =
             $("div.ux-labels-values--shipping span.ux-textspans.ux-textspans--SECONDARY").text().trim() || null;
 
-        const specifications = [];
+        const specifications: Specification[] = [];
         $('dl[data-testid="ux-labels-values"]').each((_i, el) => {
             const name = $(el).find("dt.ux-labels-values__labels").text().trim();
             const value = $(el).find("dd.ux-labels-values__values").text().trim();
@@ -309,7 +312,7 @@ function parseCurrency(input) {
 
         const logoUrl = $("img.str-header__logo--img").attr("src") || null;
 
-        const parseAbbreviated = (text) => {
+        const parseAbbreviated = (text: string | null | undefined): number | null => {
             if (!text) return null;
             const m = text.match(/([\d,.]+)\s*([KMB]?)/i);
             if (!m) return null;
@@ -331,7 +334,7 @@ function parseCurrency(input) {
         });
 
         // Limited store items (only what's in initial SSR HTML)
-        const storeItems = [];
+        const storeItems: { name: string | null; imageUrl: string | null; currency: string | null; priceMin: number | null; priceMax: number | null; url: string | null }[] = [];
         $("article.str-item-card").each((_i, el) => {
             if (storeItems.length >= 10) return;
             const name = $(el).find(".str-item-card__property-title .str-text-span").text().trim() || null;
@@ -398,7 +401,7 @@ function parseCurrency(input) {
     await crawler.run(startUrls);
 
     const totalMs = Date.now() - benchStart;
-    const byLabel = handlerTimes.reduce((acc, h) => {
+    const byLabel = handlerTimes.reduce<Record<string, { count: number; totalMs: number }>>((acc, h) => {
         if (!acc[h.label]) acc[h.label] = { count: 0, totalMs: 0 };
         acc[h.label].count++;
         acc[h.label].totalMs += h.ms;

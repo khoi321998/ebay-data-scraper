@@ -1,4 +1,4 @@
-import { CheerioCrawler, purgeDefaultStorages } from '@crawlee/cheerio';
+import { CheerioCrawler, purgeDefaultStorages } from 'crawlee';
 import { beforeAll, describe, expect, it } from 'vitest';
 
 import { router } from '../src/routes.js';

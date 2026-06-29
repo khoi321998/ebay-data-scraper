@@ -15,21 +15,35 @@ Response shape is stable across modes. Fields not applicable to a given mode are
   - product_only  →  seller = null, sellerRef = null, sellerTechnical = null
   - seller_only   →  product = null, technical = null
 */
-import { PlaywrightCrawler, ProxyConfiguration, Dataset } from "crawlee";
-import got from "got";
-import * as cheerio from "cheerio";
-import fs from "fs/promises";
-import fsSync from "fs";
 import 'dotenv/config';
-import countries from "i18n-iso-countries";
+
 import { Actor } from 'apify';
+import * as cheerio from "cheerio";
+import { Dataset, type Log,PlaywrightCrawler } from "crawlee";
+import fsSync from "fs";
+import fs from "fs/promises";
+import got from "got";
+import countries from "i18n-iso-countries";
+import type { Page, Request as PlaywrightRequest } from "playwright";
+
+import type {
+    ActorInput,
+    CaptureMode,
+    ParsedCurrency,
+    ProductImage,
+    RequestUserData,
+    ScrapedItem,
+    SellerSection,
+    ShippingOption,
+    Specification,
+} from "./dto/index.js";
 
 const en = JSON.parse(fsSync.readFileSync('./node_modules/i18n-iso-countries/langs/en.json', 'utf8'));
 countries.registerLocale(en);
 
-function parseCurrency(input) {
+function parseCurrency(input: string | null | undefined): ParsedCurrency | null {
     if (!input) return null;
-    const currencyMap = { '$': 'USD', '€': 'EUR', '£': 'GBP', '¥': 'JPY', '₹': 'INR' };
+    const currencyMap: Record<string, string> = { '$': 'USD', '€': 'EUR', '£': 'GBP', '¥': 'JPY', '₹': 'INR' };
     const symbolMatch = input.match(/([$€£¥₹])\s*([\d,]+(?:\.\d+)?)/);
     if (symbolMatch) {
         const amount = parseFloat(symbolMatch[2].replace(/,/g, ''));
@@ -48,22 +62,22 @@ function parseCurrency(input) {
     return null;
 }
 
-function getEstimatedDaysLeft(dateText) {
+function getEstimatedDaysLeft(dateText: string): number {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
-    let currentYear = today.getFullYear();
+    const currentYear = today.getFullYear();
     let targetDate = new Date(`${dateText} ${currentYear}`);
     if (targetDate < today) {
         targetDate = new Date(`${dateText} ${currentYear + 1}`);
     }
-    const diffMs = targetDate - today;
+    const diffMs = targetDate.getTime() - today.getTime();
     return Math.round(diffMs / (1000 * 60 * 60 * 24));
 }
 
-function makePhaseLogger(log, label) {
+function makePhaseLogger(log: Log, label: string): (name: string) => void {
     const t0 = Date.now();
     let last = t0;
-    return (name) => {
+    return (name: string) => {
         const now = Date.now();
         const step = ((now - last) / 1000).toFixed(2);
         const total = ((now - t0) / 1000).toFixed(2);
@@ -72,7 +86,7 @@ function makePhaseLogger(log, label) {
     };
 }
 
-function emptySellerSection() {
+function emptySellerSection(): SellerSection {
     return {
         profileUrl: null,
         displayName: null,
@@ -97,13 +111,20 @@ function emptySellerSection() {
 
 const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
 
-(async () => {
+// Running via tsx/esbuild wraps named functions with a `__name()` helper that
+// only exists in the Node module scope. When such functions are serialized into
+// the browser via page.evaluate(), `__name` is undefined there → ReferenceError.
+// We define a no-op shim in every page of a context once (covers the secondary
+// review pages opened via context.newPage() too). Harmless under `node dist`.
+const namedShimContexts = new WeakSet<object>();
+
+void (async () => {
     await Actor.init();
 
-    let mode = 'product_and_seller';
-    let inputUrls = [];
+    let mode: CaptureMode = 'product_and_seller';
+    let inputUrls: string[] = [];
     try {
-        const input = await Actor.getInput();
+        const input = await Actor.getInput<ActorInput>();
         mode = input?.mode || 'product_and_seller';
         inputUrls = input?.startUrls || input?.productUrls || input?.sellerUrls || [];
     } catch (err) {
@@ -191,9 +212,17 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
                     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
                     'Upgrade-Insecure-Requests': '1',
                 });
+                const context = page.context();
+                if (!namedShimContexts.has(context)) {
+                    namedShimContexts.add(context);
+                    await context.addInitScript(() => {
+                        const g = globalThis as unknown as { __name?: (fn: unknown) => unknown };
+                        if (!g.__name) g.__name = (fn) => fn;
+                    });
+                }
                 await page.addInitScript(() => {
                     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                    window.chrome = { runtime: {} };
+                    (window as unknown as { chrome: unknown }).chrome = { runtime: {} };
                 });
                 // Warm session on first visit to avoid Akamai cold-start 403
                 if (request.label === 'ITEM' || request.label === 'SELLER_STORE' || request.label === 'SELLER_HUB') {
@@ -210,20 +239,20 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
             async ({ page, request, response, log }) => {
                 const status = response?.status();
                 if (!status || status < 400) return;
-                const headers = response.headers();
+                const headers = response!.headers();
                 log.error(`POST-NAV ${status} on ${request.url}`, {
                     label: request.label,
                     retryCount: request.retryCount,
                     cfRay: headers['cf-ray'] || null,
-                    server: headers['server'] || null,
+                    server: headers.server || null,
                     contentType: headers['content-type'] || null,
                     xEbayC: headers['x-ebay-c-tracking'] || null,
                 });
-                const body = await response.text().catch(() => '');
+                const body = await response!.text().catch(() => '');
                 log.error(`Response body snippet (first 800 chars)`, { snippet: body.slice(0, 800) });
                 const screenshotPath = `debug_403_${Date.now()}.png`;
-                await page.screenshot({ path: screenshotPath, fullPage: false }).catch((e) => {
-                    log.warning(`Screenshot failed: ${e.message}`);
+                await page.screenshot({ path: screenshotPath, fullPage: false }).catch((e: unknown) => {
+                    log.warning(`Screenshot failed: ${(e as Error).message}`);
                 });
                 log.error(`Screenshot saved → ${screenshotPath}`);
             },
@@ -258,14 +287,14 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
                 headers: { referer: request.url },
                 throwHttpErrors: false,
                 retry: { limit: 1 },
-            }).catch((err) => {
-                log.warning(`DESCRIPTION fetch failed: ${err.message}`, { itemId: platformItemId });
+            }).catch((err: unknown) => {
+                log.warning(`DESCRIPTION fetch failed: ${(err as Error).message}`, { itemId: platformItemId });
                 return null;
             })
             : Promise.resolve(null);
 
-        const apiEndpoints = [];
-        const requestTracker = (req) => {
+        const apiEndpoints: string[] = [];
+        const requestTracker = (req: PlaywrightRequest) => {
             const resourceType = req.resourceType();
             if (resourceType === 'xhr' || resourceType === 'fetch') {
                 apiEndpoints.push(req.url());
@@ -281,7 +310,7 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
         const $ = await parseWithCheerio();
         phase('first parseWithCheerio done');
 
-        const url = request.url;
+        const {url} = request;
         // platformItemId already extracted at handler start (above) for parallel description fetch
 
         const mpn = $('dl.ux-labels-values--mpn dd.ux-labels-values__values span.ux-textspans').text().trim() || null;
@@ -325,11 +354,11 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
 
         await fs.writeFile('scriptContent.js', scriptContent).catch(err => console.error('Error logging script:', err));
 
-        const rawPriceTexts = [];
+        const rawPriceTexts: string[] = [];
         $('div.x-price-primary span.ux-textspans').each((_i, el) => {
             rawPriceTexts.push($(el).text().trim());
         });
-        const prices = [];
+        const prices: ParsedCurrency[] = [];
         rawPriceTexts.forEach(text => {
             text.split(/\s+to\s+/i).forEach(part => {
                 const parsed = parseCurrency(part);
@@ -341,18 +370,18 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
         const priceMax = priceValues.length ? Math.max(...priceValues) : null;
         const currency = prices[0]?.currency || 'USD';
 
-        const breadcrumb = [];
-        const categoryPathIds = [];
+        const breadcrumb: string[] = [];
+        const categoryPathIds: string[] = [];
         $('a.seo-breadcrumb-text').each((i, el) => {
             breadcrumb.push($(el).find('span').text().trim());
-            const match = $(el).attr('href').match(/\/b\/[^/]+\/(\d+)\//);
+            const match = $(el).attr('href')?.match(/\/b\/[^/]+\/(\d+)\//);
             if (match) categoryPathIds.push(match[1]);
         });
         const leafCategoryName = breadcrumb.length ? breadcrumb[breadcrumb.length - 1] : null;
         const leafCategoryId = categoryPathIds.length ? categoryPathIds[categoryPathIds.length - 1] : null;
 
-        let availableQuantity = null;
-        let soldCount = null;
+        let availableQuantity: number | null = null;
+        let soldCount: number | null = null;
         $('div.x-quantity__availability span').each((i, el) => {
             const text = $(el).text().trim();
             if (text.toLowerCase().includes("last one")) { availableQuantity = 1; return; }
@@ -368,7 +397,7 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
             .join(' ').replace(/\s+/g, ' ').trim()
             .replace("See details- for more information about returns", "").trim();
 
-        const specifications = [];
+        const specifications: Specification[] = [];
         $('dl[data-testid="ux-labels-values"]').each((i, el) => {
             const name = $(el).find('dt.ux-labels-values__labels').text().trim();
             const value = $(el).find('dd.ux-labels-values__values').text().trim();
@@ -376,11 +405,11 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
         });
 
         let itemLocationText = $('div.ux-labels-values--shipping').find('span.ux-textspans.ux-textspans--SECONDARY').text().trim() || null;
-        let itemCountryCode = null;
+        let itemCountryCode: string | null = null;
         if (itemLocationText) {
             itemLocationText = itemLocationText.replace('Located in:', '').trim();
             const parts = itemLocationText.split(',');
-            let country = parts[parts.length - 1].trim().replace(/ /g, ' ').replace(/\s+/g, ' ').trim();
+            const country = parts[parts.length - 1].trim().replace(/ /g, ' ').replace(/\s+/g, ' ').trim();
             itemCountryCode = countries.getAlpha2Code(country, "en") || null;
         }
 
@@ -403,37 +432,40 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
             const countText = document.querySelector('span.ux-summary__count .ux-textspans')?.textContent?.trim() || '';
             const reviewCount = tabMatch
                 ? parseInt(tabMatch[1].replace(/,/g, ''), 10)
-                : parseInt(countText.split(' ')[0]) || null;
-            const ratingBreakdown = {};
+                : parseInt(countText.split(' ')[0], 10) || null;
+            const ratingBreakdown: Record<number, number> = {};
             document.querySelectorAll('div.ux-histogram__item--bar').forEach(el => {
-                const stars = parseInt(el.querySelector('.ux-histogram__item--bar--stars')?.textContent?.trim() || '');
-                const count = parseInt(el.querySelector('.ux-histogram__item--bar--c span')?.textContent?.trim() || '');
-                if (!isNaN(stars) && !isNaN(count)) ratingBreakdown[stars] = count;
+                const stars = parseInt(el.querySelector('.ux-histogram__item--bar--stars')?.textContent?.trim() || '', 10);
+                const count = parseInt(el.querySelector('.ux-histogram__item--bar--c span')?.textContent?.trim() || '', 10);
+                if (!Number.isNaN(stars) && !Number.isNaN(count)) ratingBreakdown[stars] = count;
             });
             return { rating, reviewCount, ratingBreakdown };
         });
 
         const mediaRegex = /"_type"\s*:\s*"VIImageType"[\s\S]*?"thumbnail"\s*:\s*\{[\s\S]*?"title"\s*:\s*"([^"]+)"[\s\S]*?"imageId"\s*:\s*"([^"]+)"[\s\S]*?"URL"\s*:\s*"([^"]+)"/g;
         const mediaMatches = [...scriptContent.matchAll(mediaRegex)];
-        const images = mediaMatches.map((m) => {
-            const url = m[3].replace("s-l140.webp", "s-l960.webp");
-            const alt = m[1];
-            if (!alt.toLowerCase().includes("video")) {
-                return { url };
-            }
-        }).filter(Boolean);
+        const images: ProductImage[] = mediaMatches
+            .map((m): ProductImage | undefined => {
+                const url = m[3].replace("s-l140.webp", "s-l960.webp");
+                const alt = m[1];
+                if (!alt.toLowerCase().includes("video")) {
+                    return { url };
+                }
+                return undefined;
+            })
+            .filter((img): img is ProductImage => img !== undefined);
 
         const paymentsSectionRegex = /"payments"\s*:\s*\{[\s\S]*?"values"\s*:\s*\[\s*\{[\s\S]*?"textSpans"\s*:\s*\[([\s\S]*?)\]\s*\}\s*\]/m;
         const paymentsMatch = scriptContent.match(paymentsSectionRegex);
-        let paymentMethods = [];
+        let paymentMethods: string[] = [];
         if (paymentsMatch) {
             const spanRegex = /"accessibilityText"\s*:\s*"([^"]+)"/g;
             paymentMethods = [...paymentsMatch[1].matchAll(spanRegex)].map(m => m[1]);
         }
 
         // const scriptBlocks = await page.$$eval('script', scripts => scripts.map(s => s.textContent).filter(Boolean));
-        const scriptBlocks = [];
-        const jsonState = {};
+        const scriptBlocks: unknown[] = [];
+        const jsonState: Record<string, unknown> = {};
         // scriptBlocks.forEach(script => {
         //     const match = script.match(/window\.__INITIAL_STATE__\s*=\s*(\{.*\});/);
         //     if (match) { try { jsonState.rootKeys = Object.keys(JSON.parse(match[1])); } catch (e) {} }
@@ -448,25 +480,25 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
         //     });
         //     return result;
         // });
-        const dataAttributes = {};
+        const dataAttributes: Record<string, unknown> = {};
 
-        const googleAnalytics = await page.$$eval('script', scripts => {
-            const ids = [];
+        const googleAnalytics = await page.$$eval('script', (scripts: HTMLScriptElement[]) => {
+            const ids: string[] = [];
             scripts.forEach(s => {
                 if (s.src?.includes('googletagmanager')) {
-                    const m = s.src.match(/id=([A-Z0-9\-]+)/);
+                    const m = s.src.match(/id=([A-Z0-9-]+)/);
                     if (m) ids.push(m[1]);
                 }
                 if (s.textContent?.includes('gtag(')) {
-                    const m = s.textContent.match(/gtag\(['"]config['"],\s*['"]([A-Z0-9\-]+)['"]\)/);
+                    const m = s.textContent.match(/gtag\(['"]config['"],\s*['"]([A-Z0-9-]+)['"]\)/);
                     if (m) ids.push(m[1]);
                 }
             });
             return ids;
         });
 
-        const facebookPixel = await page.$$eval('script', scripts => {
-            const ids = [];
+        const facebookPixel = await page.$$eval('script', (scripts: HTMLScriptElement[]) => {
+            const ids: string[] = [];
             scripts.forEach(s => {
                 if (s.textContent?.includes('fbq(')) {
                     const m = s.textContent.match(/fbq\(['"]init['"],\s*['"]([0-9]+)['"]\)/);
@@ -483,12 +515,12 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
             position: 0, listingType: null, campaignId: null
         };
 
-        const jsBundles = await page.$$eval('script[src]', scripts => scripts.map(s => s.src));
-        const cssBundles = await page.$$eval('link[rel="stylesheet"]', links => links.map(l => l.href));
+        const jsBundles = await page.$$eval('script[src]', (scripts: HTMLScriptElement[]) => scripts.map(s => s.src));
+        const cssBundles = await page.$$eval('link[rel="stylesheet"]', (links: HTMLLinkElement[]) => links.map(l => l.href));
 
         phase('tracking IDs + bundles extracted');
 
-        const shippingOptions = [];
+        const shippingOptions: ShippingOption[] = [];
 
         await page.waitForSelector('div.ux-labels-values--deliverto .ux-labels-values__values-content', { timeout: 3000 })
             .catch(() => {});
@@ -534,7 +566,7 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
         // Pick the first inner div ("Estimated between <date> and <date>") inside the deliverto values content.
         // Must target the leaf div directly — selecting all descendants would also match ancestor divs whose
         // text concatenates the sibling "Ships today..." div.
-        let deliveryTimeText = null;
+        let deliveryTimeText: string | null = null;
         const deliveryDateDiv = $after('div.ux-labels-values--deliverto .ux-labels-values__values-content > div').first();
         if (deliveryDateDiv.length) {
             const text = deliveryDateDiv.clone()
@@ -546,7 +578,7 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
             }
         }
 
-        const scrappedItem = {
+        const scrappedItem: ScrapedItem = {
             platform: "ebay",
             url: page.url(),
             capturedAt: new Date().toISOString(),
@@ -595,7 +627,7 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
             // with its own filter dropdown pre-rendered in the DOM. Scope to the
             // "This item" panel so we don't pick up "All items" URLs.
             const tabs = document.querySelectorAll('.fdbk-detail-list [role="tab"]');
-            let panel = null;
+            let panel: HTMLElement | null = null;
             for (const tab of tabs) {
                 if (/^This item/i.test(tab.textContent?.trim() || '')) {
                     const panelId = tab.getAttribute('aria-controls');
@@ -605,9 +637,9 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
             }
             const scope = panel || document;
             const options = scope.querySelectorAll('select[name="feedbackFilterDropdown"] option');
-            const urls = { negative: null, positive: null };
+            const urls: { negative: string | null; positive: string | null } = { negative: null, positive: null };
             options.forEach(opt => {
-                const val = opt.value || '';
+                const val = (opt as HTMLOptionElement).value || '';
                 if (val.includes('commentType=NEGATIVE')) urls.negative = val;
                 else if (val.includes('commentType=POSITIVE')) urls.positive = val;
             });
@@ -621,8 +653,8 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
         if (descRes && descRes.statusCode === 200 && descRes.body) {
             const $desc = cheerio.load(descRes.body);
             $desc('script, style').remove();
-            scrappedItem.product.description.html = $desc.html();
-            scrappedItem.product.description.plainText = $desc('body').text().replace(/\s+/g, ' ').trim();
+            scrappedItem.product!.description.html = $desc.html();
+            scrappedItem.product!.description.plainText = $desc('body').text().replace(/\s+/g, ' ').trim();
         } else if (descRes) {
             log.warning(`DESCRIPTION fetch ${descRes.statusCode}`, { itemId: platformItemId });
         }
@@ -636,7 +668,7 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
             // page inside ITEM_REVIEWS so both scrape concurrently in one handler.
             const primary = feedbackUrls.negative || feedbackUrls.positive;
             await crawler.addRequests([{
-                url: primary,
+                url: primary!,
                 label: "ITEM_REVIEWS",
                 userData: {
                     scrappedItem,
@@ -658,38 +690,47 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
         const phase = makePhaseLogger(log, 'ITEM_REVIEWS');
         phase('handler start');
 
-        const scrappedItem = request.userData.scrappedItem;
-        const { negativeUrl, positiveUrl } = request.userData;
+        const userData = request.userData as RequestUserData;
+        const scrappedItem = userData.scrappedItem!;
+        const { negativeUrl, positiveUrl } = userData;
 
         // eBay renders both "This item" and "All items" tabpanels in the DOM
         // (the inactive one only has `hidden=""`), so unscoped selectors mix
         // them. Each evaluate below scopes to the "This item" panel by tab text.
-        const scrapeSamples = async (p, label) => {
+        const scrapeSamples = async (p: Page, label: string) => {
             try {
                 await p.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
                 await p.waitForFunction(() => {
                     const tab = [...document.querySelectorAll('[role="tab"]')]
                         .find(t => /^This item/i.test(t.textContent?.trim() || ''));
-                    const panel = tab && document.getElementById(tab.getAttribute('aria-controls')) || document;
+                    const panel = tab && document.getElementById(tab.getAttribute('aria-controls') || '') || document;
                     if (panel.querySelector('.fdbk-result-status')) return true;
                     const cards = panel.querySelectorAll('li.fdbk-container[data-testid="feedback-cards"]');
                     if (cards.length === 0) return false;
-                    return cards[0].querySelector('.fdbk-container__details__comment span')?.textContent?.trim()?.length > 0;
+                    return (cards[0].querySelector('.fdbk-container__details__comment span')?.textContent?.trim()?.length ?? 0) > 0;
                 }, { timeout: 20000 }).catch(() => {
                     log.warning(`${label}: Expected content not found`, { url: p.url() });
                 });
                 return await p.evaluate(() => {
                     const tab = [...document.querySelectorAll('[role="tab"]')]
                         .find(t => /^This item/i.test(t.textContent?.trim() || ''));
-                    const panel = tab && document.getElementById(tab.getAttribute('aria-controls')) || document;
+                    const panel = tab && document.getElementById(tab.getAttribute('aria-controls') || '') || document;
                     const cards = panel.querySelectorAll('li.fdbk-container[data-testid="feedback-cards"]');
-                    const results = [];
+                    const results: {
+                        user: string | null;
+                        userFeedbackScore: number | null;
+                        comment: string | null;
+                        commentDate: string | null;
+                        ratingType: string | null;
+                        verifiedPurchase: boolean;
+                    }[] = [];
                     cards.forEach((card, i) => {
                         if (i >= 5) return;
                         const comment = card.querySelector('.fdbk-container__details__comment span')?.textContent?.trim() || null;
                         if (!comment) return;
                         const userRaw = card.querySelector('.fdbk-container__details__info__username span:not(.fb-clipped)')?.textContent?.trim() || null;
-                        let user = null, userFeedbackScore = null;
+                        let user: string | null = null;
+                        let userFeedbackScore: number | null = null;
                         if (userRaw) {
                             const m = userRaw.match(/^(.+?)\s*\((\d[\d,]*)\)\s*$/);
                             if (m) { user = m[1].trim(); userFeedbackScore = parseInt(m[2].replace(/,/g, ''), 10); }
@@ -704,7 +745,7 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
                     return results;
                 });
             } catch (err) {
-                log.error(`${label} failed`, { url: p.url(), error: err.message });
+                log.error(`${label} failed`, { url: p.url(), error: (err as Error).message });
                 return [];
             }
         };
@@ -715,16 +756,16 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
         const primaryLabel = primaryIsNegative ? 'ITEM_NEGATIVE_REVIEWS' : 'ITEM_POSITIVE_REVIEWS';
         const secondaryLabel = primaryIsNegative ? 'ITEM_POSITIVE_REVIEWS' : 'ITEM_NEGATIVE_REVIEWS';
 
-        let secondaryPage = null;
+        let secondaryPage: Page | null = null;
         try {
             const tasks = [scrapeSamples(page, primaryLabel)];
             if (secondaryUrl) {
                 secondaryPage = await page.context().newPage();
                 tasks.push(
                     secondaryPage.goto(secondaryUrl, { waitUntil: 'domcontentloaded', timeout: 30000 })
-                        .then(() => scrapeSamples(secondaryPage, secondaryLabel))
-                        .catch((err) => {
-                            log.error(`${secondaryLabel} navigation failed`, { url: secondaryUrl, error: err.message });
+                        .then(async () => scrapeSamples(secondaryPage!, secondaryLabel))
+                        .catch((err: unknown) => {
+                            log.error(`${secondaryLabel} navigation failed`, { url: secondaryUrl, error: (err as Error).message });
                             return [];
                         })
                 );
@@ -735,8 +776,8 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
             const negativeSamples = primaryIsNegative ? primarySamples : secondarySamples;
             const positiveSamples = primaryIsNegative ? secondarySamples : primarySamples;
 
-            scrappedItem.product.reviewsSummary.negativeReviewSamples = negativeSamples;
-            scrappedItem.product.reviewsSummary.positiveReviewSamples = positiveSamples;
+            scrappedItem.product!.reviewsSummary.negativeReviewSamples = negativeSamples;
+            scrappedItem.product!.reviewsSummary.positiveReviewSamples = positiveSamples;
             log.info(`ITEM_REVIEWS: negative=${negativeSamples.length}, positive=${positiveSamples.length}`);
 
             await chainToSeller(scrappedItem, log);
@@ -751,7 +792,7 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
     // If the product page's seller link goes to an intermediate /sch/i.html hub,
     // route through SELLER_HUB first to resolve the real seller URL from the DOM.
     // Otherwise, go straight to SELLER_STORE.
-    async function chainToSeller(scrappedItem, log) {
+    async function chainToSeller(scrappedItem: ScrapedItem, log: Log) {
         if (mode === 'product_only') {
             await Dataset.pushData(scrappedItem);
             return;
@@ -779,7 +820,7 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
             }]);
         } else {
             const baseUrl = sellerUrl.replace(/\/+$/, '');
-            scrappedItem.seller.profileUrl = baseUrl;
+            scrappedItem.seller!.profileUrl = baseUrl;
             await crawler.addRequests([{
                 url: baseUrl,
                 label: "SELLER_STORE",
@@ -798,7 +839,7 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
         const phase = makePhaseLogger(log, 'SELLER_HUB');
         phase('handler start');
 
-        const scrappedItem = request.userData.scrappedItem;
+        const scrappedItem = (request.userData as RequestUserData).scrappedItem!;
         try {
             await page.waitForSelector('.str-seller-card, a[href*="/str/"], a[href*="/usr/"]', { timeout: 20000 }).catch(() => {
                 log.warning(`SELLER_HUB: no seller-card or store/user link found`, { url: request.url });
@@ -806,13 +847,13 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
             phase('seller card/link wait done');
 
             const resolvedSellerUrl = await page.evaluate(() => {
-                const pick = (sel) => document.querySelector(sel)?.href || null;
+                const pick = (sel: string) => (document.querySelector(sel) as HTMLAnchorElement | null)?.href || null;
                 const fromCard = pick('.str-seller-card__store-name h1 a')
                     || pick('a.str-profile-link')
                     || pick('.str-seller-card__store-logo a');
                 if (fromCard) return fromCard;
                 // Fallback: first anchor on the page that points to a seller store/profile
-                const anchor = document.querySelector('a[href*="/str/"], a[href*="/usr/"]');
+                const anchor = document.querySelector('a[href*="/str/"], a[href*="/usr/"]') as HTMLAnchorElement | null;
                 return anchor?.href || null;
             });
 
@@ -841,10 +882,10 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
 
             const cleaned = sellerUrl.split('?')[0].replace(/\/+$/, '');
             log.info(`SELLER_HUB: resolved → ${cleaned}`);
-            scrappedItem.seller.profileUrl = cleaned;
+            scrappedItem.seller!.profileUrl = cleaned;
             const slugMatch = cleaned.match(/\/(?:str|usr)\/([^/?]+)/i);
-            if (slugMatch && !scrappedItem.seller.ebayUsername) {
-                scrappedItem.seller.ebayUsername = slugMatch[1];
+            if (slugMatch && !scrappedItem.seller!.ebayUsername) {
+                scrappedItem.seller!.ebayUsername = slugMatch[1];
             }
 
             await crawler.addRequests([{
@@ -854,7 +895,7 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
             }]);
             phase('SELLER_HUB handler done (enqueued SELLER_STORE)');
         } catch (err) {
-            log.error(`SELLER_HUB failed`, { url: request.url, error: err.message });
+            log.error(`SELLER_HUB failed`, { url: request.url, error: (err as Error).message });
             throw err;
         }
     });
@@ -864,8 +905,10 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
         const phase = makePhaseLogger(log, 'SELLER_STORE');
         phase('handler start');
 
-        const scrappedItem = request.userData.scrappedItem;
-        const sellerBaseUrl = request.userData.sellerBaseUrl;
+        const userData = request.userData as RequestUserData;
+        const scrappedItem = userData.scrappedItem!;
+        const seller = scrappedItem.seller!;
+        const sellerBaseUrl = userData.sellerBaseUrl!;
         try {
             await page.waitForSelector('article.str-item-card', { timeout: 15000 }).catch(() => {
                 log.warning(`SELLER_STORE: No store items found on Shop tab`, { url: request.url });
@@ -873,19 +916,19 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
             phase('store items DOM ready');
 
             const rawItems = await page.evaluate(() => {
-                const items = [];
+                const items: { name: string | null; imageUrl: string | null; priceText: string | null; url: string | null }[] = [];
                 document.querySelectorAll('article.str-item-card').forEach((el) => {
                     if (items.length >= 10) return;
                     const name = el.querySelector('.str-item-card__property-title .str-text-span')?.textContent?.trim() || null;
-                    const imageUrl = el.querySelector('img[data-testid="str-img"]')?.src || null;
+                    const imageUrl = (el.querySelector('img[data-testid="str-img"]') as HTMLImageElement | null)?.src || null;
                     const priceText = el.querySelector('.str-item-card__property-displayPrice')?.textContent?.trim() || null;
-                    const itemUrl = el.querySelector('a.str-item-card__link')?.href || null;
+                    const itemUrl = (el.querySelector('a.str-item-card__link') as HTMLAnchorElement | null)?.href || null;
                     if (name) items.push({ name, imageUrl, priceText, url: itemUrl });
                 });
                 return items;
             });
-            scrappedItem.seller.storeItems = rawItems.map(item => {
-                let priceMin = null, priceMax = null, currency = null;
+            seller.storeItems = rawItems.map(item => {
+                let priceMin: number | null = null, priceMax: number | null = null, currency: string | null = null;
                 if (item.priceText) {
                     const parts = item.priceText.split(/\s+to\s+/i);
                     const fromParsed = parseCurrency(parts[0]?.trim());
@@ -898,19 +941,19 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
                 }
                 return { name: item.name, imageUrl: item.imageUrl, currency, priceMin, priceMax, url: item.url };
             });
-            log.info(`Scraped ${scrappedItem.seller.storeItems.length} store items`);
+            log.info(`Scraped ${seller.storeItems.length} store items`);
             phase('store items extracted');
 
             const feedbackClicked = await page.evaluate(() => {
                 const tabs = document.querySelectorAll('[role="tab"]');
                 for (const tab of tabs) {
-                    if (tab.textContent?.trim().toLowerCase() === 'feedback') { tab.click(); return true; }
+                    if (tab.textContent?.trim().toLowerCase() === 'feedback') { (tab as HTMLElement).click(); return true; }
                 }
                 return false;
             });
             if (feedbackClicked) {
-                await page.waitForSelector('.rating-element', { timeout: 30000 }).catch((err) => {
-                    log.warning(`SELLER_STORE: Feedback content not found after clicking tab`, { url: request.url, error: err.message });
+                await page.waitForSelector('.rating-element', { timeout: 30000 }).catch((err: unknown) => {
+                    log.warning(`SELLER_STORE: Feedback content not found after clicking tab`, { url: request.url, error: (err as Error).message });
                 });
             } else {
                 log.warning(`SELLER_STORE: Feedback tab not found`, { url: request.url });
@@ -918,7 +961,7 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
             phase('feedback tab loaded');
 
             const { summary, detailedRatings, totalSellerFeedbackCount, displayName, ebayUsername, storeId, feedbackScore, positivePercent, itemsSold, followers, feedbackLinks, logoUrl } = await page.evaluate(() => {
-                const summary = { positive: null, neutral: null, negative: null };
+                const summary: { positive: number | null; neutral: number | null; negative: number | null } = { positive: null, neutral: null, negative: null };
                 document.querySelectorAll('.rating-element').forEach(el => {
                     const label = el.querySelector(':scope > span')?.textContent?.trim().toLowerCase();
                     const numText = el.querySelector('.INLINE_LINK')?.textContent?.trim().replace(/,/g, '');
@@ -928,14 +971,14 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
                     else if (label === 'negative') summary.negative = num;
                 });
 
-                const detailedRatings = {
+                const detailedRatings: { accurateDescription: number | null; shippingSpeed: number | null; communication: number | null; shippingCost: number | null } = {
                     accurateDescription: null, shippingSpeed: null,
                     communication: null, shippingCost: null
                 };
                 document.querySelectorAll('.fdbk-detail-seller-rating').forEach(el => {
                     const label = el.querySelector('.fdbk-detail-seller-rating__label span')?.textContent?.trim().toLowerCase();
-                    const value = parseFloat(el.querySelector('.fdbk-detail-seller-rating__value')?.textContent?.trim());
-                    if (!isNaN(value)) {
+                    const value = parseFloat(el.querySelector('.fdbk-detail-seller-rating__value')?.textContent?.trim() || '');
+                    if (!Number.isNaN(value)) {
                         if (label?.includes('accurate')) detailedRatings.accurateDescription = value;
                         else if (label?.includes('shipping cost')) detailedRatings.shippingCost = value;
                         else if (label?.includes('shipping speed')) detailedRatings.shippingSpeed = value;
@@ -954,7 +997,7 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
                     if (entityMatch) { ebayUsername = entityMatch[1]; break; }
                 }
                 if (!ebayUsername) {
-                    const fdbkLink = document.querySelector('a[href*="fdbk/feedback_profile/"]');
+                    const fdbkLink = document.querySelector('a[href*="fdbk/feedback_profile/"]') as HTMLAnchorElement | null;
                     if (fdbkLink) {
                         const hrefMatch = fdbkLink.href.match(/\/fdbk\/feedback_profile\/([^/?]+)/);
                         if (hrefMatch) ebayUsername = decodeURIComponent(hrefMatch[1]);
@@ -967,7 +1010,7 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
                 const displayName = document.querySelector('.str-seller-card__store-name h1 a')?.textContent?.trim()
                     || document.querySelector('.str-seller-card__store-name h1')?.textContent?.trim()
                     || document.querySelector('.x-sellercard-atf__info__about-seller a .ux-textspans--BOLD')?.textContent?.trim()
-                    || document.querySelector('img.str-header__logo--img')?.alt?.trim()
+                    || (document.querySelector('img.str-header__logo--img') as HTMLImageElement | null)?.alt?.trim()
                     || (() => {
                         const t = document.title || '';
                         const m = t.match(/^(.+?)\s*[|–—]/);
@@ -979,12 +1022,12 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
                 const trackEl = document.querySelector('[data-track*="soid"]');
                 if (trackEl) {
                     try {
-                        const trackData = JSON.parse(trackEl.getAttribute('data-track'));
+                        const trackData = JSON.parse(trackEl.getAttribute('data-track') || '{}');
                         storeId = trackData?.eventProperty?.['ads-soid'] || trackData?.eventProperty?.soid || null;
-                    } catch (e) {}
+                    } catch (e) { /* ignore malformed data-track */ }
                 }
 
-                function parseAbbreviated(text) {
+                function parseAbbreviated(text: string): number | null {
                     if (!text) return null;
                     const m = text.match(/([\d,.]+)\s*([KMB]?)/i);
                     if (!m) return null;
@@ -1012,7 +1055,7 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
                 let positivePercent = null;
                 const percentEl = document.querySelector('.fdbk-overall-rating__bar-text');
                 if (percentEl) {
-                    positivePercent = parseFloat(percentEl.textContent?.trim().replace('%', '')) || null;
+                    positivePercent = parseFloat(percentEl.textContent?.trim().replace('%', '') || '') || null;
                 }
                 if (!positivePercent) {
                     const altPercent = document.querySelector('.fdbk-overall-rating .SECONDARY')?.textContent?.trim()
@@ -1026,7 +1069,7 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
                     if (total > 0) positivePercent = Math.round((summary.positive / total) * 10000) / 100;
                 }
 
-                const feedbackLinks = { negative: null, positive: null };
+                const feedbackLinks: { negative: string | null; positive: string | null } = { negative: null, positive: null };
                 document.querySelectorAll('.rating-element').forEach(el => {
                     const label = el.querySelector(':scope > span')?.textContent?.trim().toLowerCase();
                     const href = el.querySelector('a')?.href;
@@ -1034,28 +1077,28 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
                     else if (label === 'positive' && href) feedbackLinks.positive = href;
                 });
 
-                const logoUrl = document.querySelector('img.str-header__logo--img')?.src || null;
+                const logoUrl = (document.querySelector('img.str-header__logo--img') as HTMLImageElement | null)?.src || null;
 
                 return { summary, detailedRatings, totalSellerFeedbackCount, displayName, ebayUsername, storeId, feedbackScore, positivePercent, itemsSold, followers, feedbackLinks, logoUrl };
             });
 
-            let resolvedUsername = ebayUsername || scrappedItem.seller.ebayUsername;
+            let resolvedUsername = ebayUsername || seller.ebayUsername;
             if (!resolvedUsername) {
                 const slugMatch = sellerBaseUrl.match(/\/(?:str|usr)\/([^/?]+)/i);
                 if (slugMatch) resolvedUsername = slugMatch[1];
             }
 
-            scrappedItem.seller.displayName = displayName || scrappedItem.seller.displayName || resolvedUsername;
-            scrappedItem.seller.ebayUsername = resolvedUsername;
-            scrappedItem.seller.storeId = storeId;
-            scrappedItem.seller.logoUrl = logoUrl;
-            scrappedItem.seller.feedbackScore = feedbackScore;
-            scrappedItem.seller.positivePercent = positivePercent;
-            scrappedItem.seller.itemsSold = itemsSold;
-            scrappedItem.seller.followers = followers;
-            scrappedItem.seller.feedback.summary = summary;
-            scrappedItem.seller.feedback.detailedRatings = detailedRatings;
-            scrappedItem.seller.totalSellerFeedbackCount = totalSellerFeedbackCount;
+            seller.displayName = displayName || seller.displayName || resolvedUsername;
+            seller.ebayUsername = resolvedUsername;
+            seller.storeId = storeId;
+            seller.logoUrl = logoUrl;
+            seller.feedbackScore = feedbackScore;
+            seller.positivePercent = positivePercent;
+            seller.itemsSold = itemsSold;
+            seller.followers = followers;
+            seller.feedback.summary = summary;
+            seller.feedback.detailedRatings = detailedRatings;
+            seller.totalSellerFeedbackCount = totalSellerFeedbackCount;
 
             const sellerTechnical = await page.evaluate(() => {
                 // const scriptBlocks = [...document.querySelectorAll('script')].map(s => s.textContent).filter(Boolean);
@@ -1073,15 +1116,15 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
                 //     }
                 // });
 
-                const googleAnalytics = [];
-                const facebookPixel = [];
+                const googleAnalytics: string[] = [];
+                const facebookPixel: string[] = [];
                 document.querySelectorAll('script').forEach(s => {
                     if (s.src?.includes('googletagmanager')) {
-                        const m = s.src.match(/id=([A-Z0-9\-]+)/);
+                        const m = s.src.match(/id=([A-Z0-9-]+)/);
                         if (m) googleAnalytics.push(m[1]);
                     }
                     if (s.textContent?.includes('gtag(')) {
-                        const m = s.textContent.match(/gtag\(['"]config['"],\s*['"]([A-Z0-9\-]+)['"]\)/);
+                        const m = s.textContent.match(/gtag\(['"]config['"],\s*['"]([A-Z0-9-]+)['"]\)/);
                         if (m) googleAnalytics.push(m[1]);
                     }
                     if (s.textContent?.includes('fbq(')) {
@@ -1090,8 +1133,8 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
                     }
                 });
 
-                const jsBundles = [...document.querySelectorAll('script[src]')].map(s => s.src);
-                const cssBundles = [...document.querySelectorAll('link[rel="stylesheet"]')].map(l => l.href);
+                const jsBundles = [...document.querySelectorAll('script[src]')].map(s => (s as HTMLScriptElement).src);
+                const cssBundles = [...document.querySelectorAll('link[rel="stylesheet"]')].map(l => (l as HTMLLinkElement).href);
 
                 return { scriptBlocks: scriptBlocks.length, jsonState, dataAttributes, trackingIds: { googleAnalytics, facebookPixel }, jsBundles, cssBundles };
             });
@@ -1101,7 +1144,7 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
             const aboutClicked = await page.evaluate(() => {
                 const tabs = document.querySelectorAll('[role="tab"]');
                 for (const tab of tabs) {
-                    if (tab.textContent?.trim().toLowerCase() === 'about') { tab.click(); return true; }
+                    if (tab.textContent?.trim().toLowerCase() === 'about') { (tab as HTMLElement).click(); return true; }
                 }
                 return false;
             });
@@ -1110,13 +1153,13 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
             }
             const aboutData = await page.evaluate(() => {
                 const aboutDescription = document.querySelector('.str-about-description__description .str-text-span')?.textContent?.trim() || null;
-                const sellerInfoMap = {};
+                const sellerInfoMap: Record<string, string> = {};
                 document.querySelectorAll('.str-about-description__seller-info > span').forEach(el => {
                     const key = el.querySelector('.SECONDARY')?.textContent?.replace(/[: ]/g, '').trim().toLowerCase();
                     const value = el.querySelector('.BOLD')?.textContent?.trim();
                     if (key && value) sellerInfoMap[key] = value;
                 });
-                const businessDetails = {};
+                const businessDetails: Record<string, string> = {};
                 document.querySelectorAll('.str-business-details__seller-info > span').forEach(el => {
                     const key = el.querySelector('.SECONDARY')?.textContent?.replace(/[: ]/g, '').trim().toLowerCase();
                     const value = el.querySelector('.BOLD')?.textContent?.trim();
@@ -1124,9 +1167,9 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
                 });
                 return { aboutDescription, sellerInfoMap, businessDetails };
             });
-            scrappedItem.seller.about = {
+            seller.about = {
                 description: aboutData.aboutDescription,
-                location: aboutData.sellerInfoMap['location'] || null,
+                location: aboutData.sellerInfoMap.location || null,
                 memberSince: aboutData.sellerInfoMap['member since'] || null,
                 businessDetails: Object.keys(aboutData.businessDetails).length ? aboutData.businessDetails : null
             };
@@ -1135,7 +1178,7 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
             if (feedbackLinks.negative || feedbackLinks.positive) {
                 const primary = feedbackLinks.negative || feedbackLinks.positive;
                 await crawler.addRequests([{
-                    url: primary,
+                    url: primary!,
                     label: "SELLER_REVIEWS",
                     userData: {
                         scrappedItem,
@@ -1149,7 +1192,7 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
             }
             phase('SELLER_STORE handler done');
         } catch (err) {
-            log.error(`SELLER_STORE failed`, { url: request.url, error: err.message });
+            log.error(`SELLER_STORE failed`, { url: request.url, error: (err as Error).message });
             throw err;
         }
     });
@@ -1161,29 +1204,38 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
         const phase = makePhaseLogger(log, 'SELLER_REVIEWS');
         phase('handler start');
 
-        const scrappedItem = request.userData.scrappedItem;
-        const { negativeUrl, positiveUrl } = request.userData;
+        const userData = request.userData as RequestUserData;
+        const scrappedItem = userData.scrappedItem!;
+        const seller = scrappedItem.seller!;
+        const { negativeUrl, positiveUrl } = userData;
 
-        const scrapeSamples = async (p, label) => {
+        const scrapeSamples = async (p: Page, label: string) => {
             try {
                 await p.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
                 await p.waitForFunction(() => {
                     if (document.querySelector('.fdbk-result-status')) return true;
                     const rows = document.querySelectorAll('tr[data-feedback-id]');
                     if (rows.length > 0) {
-                        return rows[0].querySelector('.card__comment span')?.textContent?.trim()?.length > 0;
+                        return (rows[0].querySelector('.card__comment span')?.textContent?.trim()?.length ?? 0) > 0;
                     }
                     const cards = document.querySelectorAll('li.fdbk-container[data-testid="feedback-cards"]');
                     if (cards.length > 0) {
-                        return cards[0].querySelector('.fdbk-container__details__comment span')?.textContent?.trim()?.length > 0;
+                        return (cards[0].querySelector('.fdbk-container__details__comment span')?.textContent?.trim()?.length ?? 0) > 0;
                     }
                     return false;
                 }, { timeout: 40000 }).catch(() => {
                     log.warning(`${label}: Expected content not found`, { url: p.url() });
                 });
                 return await p.evaluate(() => {
-                    const results = [];
-                    const parseUser = (raw) => {
+                    const results: {
+                        user: string | null;
+                        userFeedbackScore: number | null;
+                        comment: string | null;
+                        commentDate: string | null;
+                        ratingType: string | null;
+                        verifiedPurchase: boolean;
+                    }[] = [];
+                    const parseUser = (raw: string | null): { user: string | null; userFeedbackScore: number | null } => {
                         if (!raw) return { user: null, userFeedbackScore: null };
                         const m = raw.match(/^(.+?)\s*\((\d[\d,]*)\)\s*$/);
                         if (m) return { user: m[1].trim(), userFeedbackScore: parseInt(m[2].replace(/,/g, ''), 10) };
@@ -1223,7 +1275,7 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
                     return results;
                 });
             } catch (err) {
-                log.error(`${label} failed`, { url: p.url(), error: err.message });
+                log.error(`${label} failed`, { url: p.url(), error: (err as Error).message });
                 return [];
             }
         };
@@ -1233,16 +1285,16 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
         const primaryLabel = primaryIsNegative ? 'SELLER_NEGATIVE_REVIEWS' : 'SELLER_POSITIVE_REVIEWS';
         const secondaryLabel = primaryIsNegative ? 'SELLER_POSITIVE_REVIEWS' : 'SELLER_NEGATIVE_REVIEWS';
 
-        let secondaryPage = null;
+        let secondaryPage: Page | null = null;
         try {
             const tasks = [scrapeSamples(page, primaryLabel)];
             if (secondaryUrl) {
                 secondaryPage = await page.context().newPage();
                 tasks.push(
                     secondaryPage.goto(secondaryUrl, { waitUntil: 'domcontentloaded', timeout: 40000 })
-                        .then(() => scrapeSamples(secondaryPage, secondaryLabel))
-                        .catch((err) => {
-                            log.error(`${secondaryLabel} navigation failed`, { url: secondaryUrl, error: err.message });
+                        .then(async () => scrapeSamples(secondaryPage!, secondaryLabel))
+                        .catch((err: unknown) => {
+                            log.error(`${secondaryLabel} navigation failed`, { url: secondaryUrl, error: (err as Error).message });
                             return [];
                         })
                 );
@@ -1253,8 +1305,8 @@ const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
             const negativeSamples = primaryIsNegative ? primarySamples : secondarySamples;
             const positiveSamples = primaryIsNegative ? secondarySamples : primarySamples;
 
-            scrappedItem.seller.feedback.negativeReviewSamples = negativeSamples;
-            scrappedItem.seller.feedback.positiveReviewSamples = positiveSamples;
+            seller.feedback.negativeReviewSamples = negativeSamples;
+            seller.feedback.positiveReviewSamples = positiveSamples;
             log.info(`SELLER_REVIEWS: negative=${negativeSamples.length}, positive=${positiveSamples.length}`);
 
             await Dataset.pushData(scrappedItem);
