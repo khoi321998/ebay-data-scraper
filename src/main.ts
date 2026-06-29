@@ -293,14 +293,15 @@ void (async () => {
             })
             : Promise.resolve(null);
 
-        const apiEndpoints: string[] = [];
-        const requestTracker = (req: PlaywrightRequest) => {
-            const resourceType = req.resourceType();
-            if (resourceType === 'xhr' || resourceType === 'fetch') {
-                apiEndpoints.push(req.url());
-            }
-        };
-        page.on('request', requestTracker);
+        // [technical] temporarily commented out apiEndpoints collection
+        // const apiEndpoints: string[] = [];
+        // const requestTracker = (req: PlaywrightRequest) => {
+        //     const resourceType = req.resourceType();
+        //     if (resourceType === 'xhr' || resourceType === 'fetch') {
+        //         apiEndpoints.push(req.url());
+        //     }
+        // };
+        // page.on('request', requestTracker);
 
         // Resolve as soon as the critical listing DOM is painted (title + price).
         // Falls through after 20s max if eBay's slow; cheerio parsing tolerates partial DOM.
@@ -463,9 +464,10 @@ void (async () => {
             paymentMethods = [...paymentsMatch[1].matchAll(spanRegex)].map(m => m[1]);
         }
 
+        // [technical] temporarily commented out the entire technical processing
         // const scriptBlocks = await page.$$eval('script', scripts => scripts.map(s => s.textContent).filter(Boolean));
-        const scriptBlocks: unknown[] = [];
-        const jsonState: Record<string, unknown> = {};
+        // const scriptBlocks: unknown[] = [];
+        // const jsonState: Record<string, unknown> = {};
         // scriptBlocks.forEach(script => {
         //     const match = script.match(/window\.__INITIAL_STATE__\s*=\s*(\{.*\});/);
         //     if (match) { try { jsonState.rootKeys = Object.keys(JSON.parse(match[1])); } catch (e) {} }
@@ -480,51 +482,51 @@ void (async () => {
         //     });
         //     return result;
         // });
-        const dataAttributes: Record<string, unknown> = {};
+        // const dataAttributes: Record<string, unknown> = {};
 
-        const googleAnalytics = await page.$$eval('script', (scripts: HTMLScriptElement[]) => {
-            const ids: string[] = [];
-            scripts.forEach(s => {
-                if (s.src?.includes('googletagmanager')) {
-                    const m = s.src.match(/id=([A-Z0-9-]+)/);
-                    if (m) ids.push(m[1]);
-                }
-                if (s.textContent?.includes('gtag(')) {
-                    const m = s.textContent.match(/gtag\(['"]config['"],\s*['"]([A-Z0-9-]+)['"]\)/);
-                    if (m) ids.push(m[1]);
-                }
-            });
-            return ids;
-        });
+        // const googleAnalytics = await page.$$eval('script', (scripts: HTMLScriptElement[]) => {
+        //     const ids: string[] = [];
+        //     scripts.forEach(s => {
+        //         if (s.src?.includes('googletagmanager')) {
+        //             const m = s.src.match(/id=([A-Z0-9-]+)/);
+        //             if (m) ids.push(m[1]);
+        //         }
+        //         if (s.textContent?.includes('gtag(')) {
+        //             const m = s.textContent.match(/gtag\(['"]config['"],\s*['"]([A-Z0-9-]+)['"]\)/);
+        //             if (m) ids.push(m[1]);
+        //         }
+        //     });
+        //     return ids;
+        // });
 
-        const facebookPixel = await page.$$eval('script', (scripts: HTMLScriptElement[]) => {
-            const ids: string[] = [];
-            scripts.forEach(s => {
-                if (s.textContent?.includes('fbq(')) {
-                    const m = s.textContent.match(/fbq\(['"]init['"],\s*['"]([0-9]+)['"]\)/);
-                    if (m) ids.push(m[1]);
-                }
-            });
-            return ids;
-        });
+        // const facebookPixel = await page.$$eval('script', (scripts: HTMLScriptElement[]) => {
+        //     const ids: string[] = [];
+        //     scripts.forEach(s => {
+        //         if (s.textContent?.includes('fbq(')) {
+        //             const m = s.textContent.match(/fbq\(['"]init['"],\s*['"]([0-9]+)['"]\)/);
+        //             if (m) ids.push(m[1]);
+        //         }
+        //     });
+        //     return ids;
+        // });
 
-        const urlObj = new URL(request.url);
-        const pageContext = {
-            pageType: request.url.includes('/itm/') ? 'listing' : 'searchResults',
-            searchQuery: urlObj.searchParams.get('_nkw'),
-            position: 0, listingType: null, campaignId: null
-        };
+        // const urlObj = new URL(request.url);
+        // const pageContext = {
+        //     pageType: request.url.includes('/itm/') ? 'listing' : 'searchResults',
+        //     searchQuery: urlObj.searchParams.get('_nkw'),
+        //     position: 0, listingType: null, campaignId: null
+        // };
 
-        const jsBundles = await page.$$eval('script[src]', (scripts: HTMLScriptElement[]) => scripts.map(s => s.src));
-        const cssBundles = await page.$$eval('link[rel="stylesheet"]', (links: HTMLLinkElement[]) => links.map(l => l.href));
+        // const jsBundles = await page.$$eval('script[src]', (scripts: HTMLScriptElement[]) => scripts.map(s => s.src));
+        // const cssBundles = await page.$$eval('link[rel="stylesheet"]', (links: HTMLLinkElement[]) => links.map(l => l.href));
 
-        phase('tracking IDs + bundles extracted');
+        // phase('tracking IDs + bundles extracted');
 
         const shippingOptions: ShippingOption[] = [];
 
         await page.waitForSelector('div.ux-labels-values--deliverto .ux-labels-values__values-content', { timeout: 3000 })
             .catch(() => {});
-        page.off('request', requestTracker);
+        // [technical] page.off('request', requestTracker);
 
         const $after = await parseWithCheerio();
 
@@ -600,12 +602,14 @@ void (async () => {
             },
             sellerRef: mode === 'product_only' ? null : { platformSellerId, displayName, ebayUsername },
             seller: mode === 'product_only' ? null : emptySellerSection(),
-            technical: {
-                scriptBlocks, jsonState, dataAttributes,
-                rawUrlParameters: Object.fromEntries(urlObj.searchParams.entries()),
-                experimentIds: [], trackingIds: { googleAnalytics, facebookPixel },
-                pageContext, fulfilmentCodes: [], jsBundles, cssBundles, apiEndpoints
-            },
+            // [technical] temporarily commented out the technical processing
+            technical: null,
+            // technical: {
+            //     scriptBlocks, jsonState, dataAttributes,
+            //     rawUrlParameters: Object.fromEntries(urlObj.searchParams.entries()),
+            //     experimentIds: [], trackingIds: { googleAnalytics, facebookPixel },
+            //     pageContext, fulfilmentCodes: [], jsBundles, cssBundles, apiEndpoints
+            // },
             sellerTechnical: null
         };
 
@@ -1100,46 +1104,47 @@ void (async () => {
             seller.feedback.detailedRatings = detailedRatings;
             seller.totalSellerFeedbackCount = totalSellerFeedbackCount;
 
-            const sellerTechnical = await page.evaluate(() => {
-                // const scriptBlocks = [...document.querySelectorAll('script')].map(s => s.textContent).filter(Boolean);
-                const scriptBlocks = [];
-                const jsonState = {};
-                // scriptBlocks.forEach(script => {
-                //     const match = script.match(/window\.__INITIAL_STATE__\s*=\s*(\{.*\});/);
-                //     if (match) { try { jsonState.rootKeys = Object.keys(JSON.parse(match[1])); } catch (e) {} }
-                // });
+            // [technical] temporarily commented out the sellerTechnical processing
+            // const sellerTechnical = await page.evaluate(() => {
+            //     // const scriptBlocks = [...document.querySelectorAll('script')].map(s => s.textContent).filter(Boolean);
+            //     const scriptBlocks = [];
+            //     const jsonState = {};
+            //     // scriptBlocks.forEach(script => {
+            //     //     const match = script.match(/window\.__INITIAL_STATE__\s*=\s*(\{.*\});/);
+            //     //     if (match) { try { jsonState.rootKeys = Object.keys(JSON.parse(match[1])); } catch (e) {} }
+            //     // });
 
-                const dataAttributes = {};
-                // document.querySelectorAll('*').forEach(el => {
-                //     for (const attr of el.attributes) {
-                //         if (attr.name.startsWith('data-')) dataAttributes[attr.name] = attr.value;
-                //     }
-                // });
+            //     const dataAttributes = {};
+            //     // document.querySelectorAll('*').forEach(el => {
+            //     //     for (const attr of el.attributes) {
+            //     //         if (attr.name.startsWith('data-')) dataAttributes[attr.name] = attr.value;
+            //     //     }
+            //     // });
 
-                const googleAnalytics: string[] = [];
-                const facebookPixel: string[] = [];
-                document.querySelectorAll('script').forEach(s => {
-                    if (s.src?.includes('googletagmanager')) {
-                        const m = s.src.match(/id=([A-Z0-9-]+)/);
-                        if (m) googleAnalytics.push(m[1]);
-                    }
-                    if (s.textContent?.includes('gtag(')) {
-                        const m = s.textContent.match(/gtag\(['"]config['"],\s*['"]([A-Z0-9-]+)['"]\)/);
-                        if (m) googleAnalytics.push(m[1]);
-                    }
-                    if (s.textContent?.includes('fbq(')) {
-                        const m = s.textContent.match(/fbq\(['"]init['"],\s*['"](\d+)['"]\)/);
-                        if (m) facebookPixel.push(m[1]);
-                    }
-                });
+            //     const googleAnalytics: string[] = [];
+            //     const facebookPixel: string[] = [];
+            //     document.querySelectorAll('script').forEach(s => {
+            //         if (s.src?.includes('googletagmanager')) {
+            //             const m = s.src.match(/id=([A-Z0-9-]+)/);
+            //             if (m) googleAnalytics.push(m[1]);
+            //         }
+            //         if (s.textContent?.includes('gtag(')) {
+            //             const m = s.textContent.match(/gtag\(['"]config['"],\s*['"]([A-Z0-9-]+)['"]\)/);
+            //             if (m) googleAnalytics.push(m[1]);
+            //         }
+            //         if (s.textContent?.includes('fbq(')) {
+            //             const m = s.textContent.match(/fbq\(['"]init['"],\s*['"](\d+)['"]\)/);
+            //             if (m) facebookPixel.push(m[1]);
+            //         }
+            //     });
 
-                const jsBundles = [...document.querySelectorAll('script[src]')].map(s => (s as HTMLScriptElement).src);
-                const cssBundles = [...document.querySelectorAll('link[rel="stylesheet"]')].map(l => (l as HTMLLinkElement).href);
+            //     const jsBundles = [...document.querySelectorAll('script[src]')].map(s => (s as HTMLScriptElement).src);
+            //     const cssBundles = [...document.querySelectorAll('link[rel="stylesheet"]')].map(l => (l as HTMLLinkElement).href);
 
-                return { scriptBlocks: scriptBlocks.length, jsonState, dataAttributes, trackingIds: { googleAnalytics, facebookPixel }, jsBundles, cssBundles };
-            });
-            scrappedItem.sellerTechnical = sellerTechnical;
-            phase('seller data + technical extracted');
+            //     return { scriptBlocks: scriptBlocks.length, jsonState, dataAttributes, trackingIds: { googleAnalytics, facebookPixel }, jsBundles, cssBundles };
+            // });
+            // scrappedItem.sellerTechnical = sellerTechnical;
+            phase('seller data extracted');
 
             const aboutClicked = await page.evaluate(() => {
                 const tabs = document.querySelectorAll('[role="tab"]');
