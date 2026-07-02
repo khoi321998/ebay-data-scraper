@@ -204,19 +204,18 @@ void (async () => {
                 .html() || "";
         const ebayUsername = scriptContent.match(/"entity_id"\s*:\s*"~([^"]+)"/)?.[1] || null;
 
-        // Images via regex on script content (same approach as main.js)
+        // Images from PICTURE.mediaList JSON (same approach as main.js). IMPORTANT:
+        // only eBay-hosted images carry an "imageId"; the seller's own CloudFront
+        // images do NOT. Requiring "imageId" made the lazy scan jump past every
+        // CloudFront image to the next eBay imageId (91 gallery images collapsed to
+        // 2). We drop the imageId requirement and use [^{}] to keep each match
+        // inside the thumbnail object so it can't skip across mediaList items.
         const mediaRegex =
-            /"_type"\s*:\s*"VIImageType"[\s\S]*?"thumbnail"\s*:\s*\{[\s\S]*?"title"\s*:\s*"([^"]+)"[\s\S]*?"imageId"\s*:\s*"([^"]+)"[\s\S]*?"URL"\s*:\s*"([^"]+)"/g;
+            /"_type":"VIImageType","thumbnail":\{[^{}]*?"title":"([^"]+)"[^{}]*?"URL":"([^"]+)"/g;
         const images = [...scriptContent.matchAll(mediaRegex)]
-            .map((m, i) => {
-                if (m[1].toLowerCase().includes("video")) return null;
-                return {
-                    url: m[3].replace("s-l140.webp", "s-l960.webp"),
-                    variantKey: m[2],
-                    isMain: i === 0,
-                };
-            })
-            .filter(Boolean);
+            .filter((m) => !m[1].toLowerCase().includes("video"))
+            // Upscale eBay thumbnails (s-l140) to full-res; CloudFront URLs untouched.
+            .map((m) => ({ url: m[2].replace(/s-l140\.(webp|jpg|jpeg|png)/i, "s-l1600.$1") }));
 
         const elapsed = Date.now() - t0;
         handlerTimes.push({ label: "ITEM", ms: elapsed });

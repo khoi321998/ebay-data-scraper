@@ -448,18 +448,20 @@ void (async () => {
             return { rating, reviewCount, ratingBreakdown };
         });
 
-        const mediaRegex = /"_type"\s*:\s*"VIImageType"[\s\S]*?"thumbnail"\s*:\s*\{[\s\S]*?"title"\s*:\s*"([^"]+)"[\s\S]*?"imageId"\s*:\s*"([^"]+)"[\s\S]*?"URL"\s*:\s*"([^"]+)"/g;
-        const mediaMatches = [...scriptContent.matchAll(mediaRegex)];
-        const images: ProductImage[] = mediaMatches
-            .map((m): ProductImage | undefined => {
-                const url = m[3].replace("s-l140.webp", "s-l960.webp");
-                const alt = m[1];
-                if (!alt.toLowerCase().includes("video")) {
-                    return { url };
-                }
-                return undefined;
-            })
-            .filter((img): img is ProductImage => img !== undefined);
+        // Images from PICTURE.mediaList JSON. Each gallery image is a VIImageType
+        // whose thumbnail carries the URL. IMPORTANT: only eBay-hosted images have
+        // an "imageId"; the seller's own CloudFront images do NOT. The old regex
+        // required "imageId" between title and URL, so for a CloudFront thumbnail
+        // the lazy scan jumped forward to the next eBay image's imageId — swallowing
+        // every image in between (91 gallery images collapsed to 2). We drop the
+        // imageId requirement and use [^{}] to confine each match to inside the
+        // thumbnail object so it can't skip across mediaList items.
+        const mediaRegex = /"_type":"VIImageType","thumbnail":\{[^{}]*?"title":"([^"]+)"[^{}]*?"URL":"([^"]+)"/g;
+        const images: ProductImage[] = [...scriptContent.matchAll(mediaRegex)]
+            .filter((m) => !m[1].toLowerCase().includes("video"))
+            // Upscale eBay thumbnails (s-l140) to full-res; CloudFront URLs (no size
+            // variants) are left untouched by the replace.
+            .map((m): ProductImage => ({ url: m[2].replace(/s-l140\.(webp|jpg|jpeg|png)/i, "s-l1600.$1") }));
 
         const paymentsSectionRegex = /"payments"\s*:\s*\{[\s\S]*?"values"\s*:\s*\[\s*\{[\s\S]*?"textSpans"\s*:\s*\[([\s\S]*?)\]\s*\}\s*\]/m;
         const paymentsMatch = scriptContent.match(paymentsSectionRegex);
