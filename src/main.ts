@@ -400,8 +400,13 @@ void (async () => {
 
         const specifications: Specification[] = [];
         $('dl[data-testid="ux-labels-values"]').each((i, el) => {
-            const name = $(el).find('dt.ux-labels-values__labels').text().trim();
-            const value = $(el).find('dd.ux-labels-values__values').text().trim();
+            const name = $(el).find('dt.ux-labels-values__labels').text().replace(/\s+/g, ' ').trim();
+            // Clone the value cell and strip the collapsed hidden duplicate, screen-reader-only
+            // (.clipped) text, and inline actions — e.g. Condition's "Read more" / "See all
+            // condition definitions" / "opens in a new window or tab" — before reading text.
+            const $value = $(el).find('dd.ux-labels-values__values').clone();
+            $value.find('[aria-hidden="true"], .clipped, [data-testid="ux-action"]').remove();
+            const value = $value.text().replace(/\s+/g, ' ').trim();
             if (name && value) specifications.push({ name, value });
         });
 
