@@ -170,11 +170,18 @@ void (async () => {
         });
     } else {
         // product_only and product_and_seller both start at ITEM
-        startUrls = inputUrls.map(url => ({
-            url: `${url}?rt=nc&_ipg=1&location=US`,
-            label: 'ITEM',
-            userData: {}
-        }));
+        startUrls = inputUrls.map(url => {
+            const u = new URL(url);
+            u.searchParams.set('rt', 'nc');
+            u.searchParams.set('_ipg', '1');
+            u.searchParams.set('location', 'US');
+            console.log(`ITEM start URL: ${u.toString()}`);
+            return {
+                url: u.toString(),
+                label: 'ITEM',
+                userData: {}
+            };
+        });
     }
 
     const proxyConfiguration = await Actor.createProxyConfiguration({
@@ -647,10 +654,12 @@ void (async () => {
                 }
             }
             const scope = panel || document;
-            const options = scope.querySelectorAll('select[name="feedbackFilterDropdown"] option');
+            // eBay replaced the native <select name="feedbackFilterDropdown"> with a
+            // custom "fake-menu-button" widget rendering <a> items with hrefs.
+            const links = scope.querySelectorAll('a.fake-menu-button__item[href], select[name="feedbackFilterDropdown"] option');
             const urls: { negative: string | null; positive: string | null } = { negative: null, positive: null };
-            options.forEach(opt => {
-                const val = (opt as HTMLOptionElement).value || '';
+            links.forEach(el => {
+                const val = (el as HTMLAnchorElement).href || (el as HTMLOptionElement).value || '';
                 if (val.includes('commentType=NEGATIVE')) urls.negative = val;
                 else if (val.includes('commentType=POSITIVE')) urls.positive = val;
             });
@@ -716,7 +725,7 @@ void (async () => {
                         .find(t => /^This item/i.test(t.textContent?.trim() || ''));
                     const panel = tab && document.getElementById(tab.getAttribute('aria-controls') || '') || document;
                     if (panel.querySelector('.fdbk-result-status')) return true;
-                    const cards = panel.querySelectorAll('li.fdbk-container[data-testid="feedback-cards"]');
+                    const cards = panel.querySelectorAll('li.fdbk-container[data-testid*="feedback-cards"]');
                     if (cards.length === 0) return false;
                     return (cards[0].querySelector('.fdbk-container__details__comment span')?.textContent?.trim()?.length ?? 0) > 0;
                 }, { timeout: 20000 }).catch(() => {
@@ -726,7 +735,7 @@ void (async () => {
                     const tab = [...document.querySelectorAll('[role="tab"]')]
                         .find(t => /^This item/i.test(t.textContent?.trim() || ''));
                     const panel = tab && document.getElementById(tab.getAttribute('aria-controls') || '') || document;
-                    const cards = panel.querySelectorAll('li.fdbk-container[data-testid="feedback-cards"]');
+                    const cards = panel.querySelectorAll('li.fdbk-container[data-testid*="feedback-cards"]');
                     const results: {
                         user: string | null;
                         userFeedbackScore: number | null;
@@ -1230,7 +1239,7 @@ void (async () => {
                     if (rows.length > 0) {
                         return (rows[0].querySelector('.card__comment span')?.textContent?.trim()?.length ?? 0) > 0;
                     }
-                    const cards = document.querySelectorAll('li.fdbk-container[data-testid="feedback-cards"]');
+                    const cards = document.querySelectorAll('li.fdbk-container[data-testid*="feedback-cards"]');
                     if (cards.length > 0) {
                         return (cards[0].querySelector('.fdbk-container__details__comment span')?.textContent?.trim()?.length ?? 0) > 0;
                     }
@@ -1271,7 +1280,7 @@ void (async () => {
                         results.push({ user: userName, userFeedbackScore, comment, commentDate, ratingType, verifiedPurchase });
                     });
                     if (results.length === 0) {
-                        document.querySelectorAll('li.fdbk-container[data-testid="feedback-cards"]').forEach((card) => {
+                        document.querySelectorAll('li.fdbk-container[data-testid*="feedback-cards"]').forEach((card) => {
                             if (results.length >= 5) return;
                             const comment = card.querySelector('.fdbk-container__details__comment span')?.textContent?.trim();
                             if (!comment) return;

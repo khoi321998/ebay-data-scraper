@@ -64,11 +64,18 @@ void (async () => {
             };
         });
     } else {
-        startUrls = inputUrls.map((url) => ({
-            url: `${url}?rt=nc&_ipg=1&location=US`,
-            label: "ITEM",
-            userData: {},
-        }));
+        startUrls = inputUrls.map((url) => {
+            const u = new URL(url);
+            u.searchParams.set("rt", "nc");
+            u.searchParams.set("_ipg", "1");
+            u.searchParams.set("location", "US");
+            console.log(`[cheerio] ITEM start URL: ${u.toString()}`);
+            return {
+                url: u.toString(),
+                label: "ITEM",
+                userData: {},
+            };
+        });
     }
 
     const proxyConfiguration = await Actor.createProxyConfiguration({
