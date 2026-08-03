@@ -32,6 +32,7 @@ import type {
     ParsedCurrency,
     ProductImage,
     RequestUserData,
+    ReviewSample,
     ScrapedItem,
     SellerSection,
     ShippingOption,
@@ -100,7 +101,8 @@ function emptySellerSection(): SellerSection {
             summary: { positive: null, neutral: null, negative: null },
             detailedRatings: { accurateDescription: null, shippingSpeed: null, communication: null, shippingCost: null },
             negativeReviewSamples: [],
-            positiveReviewSamples: []
+            positiveReviewSamples: [],
+            neutralReviewSamples: []
         },
         totalSellerFeedbackCount: null,
         about: null,
@@ -611,7 +613,7 @@ void (async () => {
                 media: { images, videos: [] },
                 reviewsSummary: {
                     rating, reviewCount, ratingBreakdown,
-                    negativeReviewSamples: [], positiveReviewSamples: []
+                    negativeReviewSamples: [], positiveReviewSamples: [], neutralReviewSamples: []
                 }
             },
             sellerRef: mode === 'product_only' ? null : { platformSellerId, displayName, ebayUsername },
@@ -657,11 +659,12 @@ void (async () => {
             // eBay replaced the native <select name="feedbackFilterDropdown"> with a
             // custom "fake-menu-button" widget rendering <a> items with hrefs.
             const links = scope.querySelectorAll('a.fake-menu-button__item[href], select[name="feedbackFilterDropdown"] option');
-            const urls: { negative: string | null; positive: string | null } = { negative: null, positive: null };
+            const urls: { negative: string | null; positive: string | null; neutral: string | null } = { negative: null, positive: null, neutral: null };
             links.forEach(el => {
                 const val = (el as HTMLAnchorElement).href || (el as HTMLOptionElement).value || '';
                 if (val.includes('commentType=NEGATIVE')) urls.negative = val;
                 else if (val.includes('commentType=POSITIVE')) urls.positive = val;
+                else if (val.includes('commentType=NEUTRAL')) urls.neutral = val;
             });
             return urls;
         });
@@ -680,13 +683,13 @@ void (async () => {
         }
         phase('description awaited (parallel got)');
 
-        log.info(`ITEM feedbackUrls: negative=${feedbackUrls?.negative} | positive=${feedbackUrls?.positive}`);
+        log.info(`ITEM feedbackUrls: negative=${feedbackUrls?.negative} | positive=${feedbackUrls?.positive} | neutral=${feedbackUrls?.neutral}`);
 
         // Enqueue ITEM_REVIEWS directly (DESCRIPTION queue round-trip removed)
-        if (feedbackUrls?.negative || feedbackUrls?.positive) {
-            // Primary URL drives Crawlee navigation; the other is opened on a second
-            // page inside ITEM_REVIEWS so both scrape concurrently in one handler.
-            const primary = feedbackUrls.negative || feedbackUrls.positive;
+        if (feedbackUrls?.negative || feedbackUrls?.positive || feedbackUrls?.neutral) {
+            // Primary URL drives Crawlee navigation; the others are opened on
+            // secondary pages inside ITEM_REVIEWS so all scrape concurrently in one handler.
+            const primary = feedbackUrls.negative || feedbackUrls.positive || feedbackUrls.neutral;
             await crawler.addRequests([{
                 url: primary!,
                 label: "ITEM_REVIEWS",
@@ -694,6 +697,7 @@ void (async () => {
                     scrappedItem,
                     negativeUrl: feedbackUrls.negative || null,
                     positiveUrl: feedbackUrls.positive || null,
+                    neutralUrl: feedbackUrls.neutral || null,
                 }
             }]);
         } else {
@@ -712,7 +716,7 @@ void (async () => {
 
         const userData = request.userData as RequestUserData;
         const scrappedItem = userData.scrappedItem!;
-        const { negativeUrl, positiveUrl } = userData;
+        const { negativeUrl, positiveUrl, neutralUrl } = userData;
 
         // eBay renders both "This item" and "All items" tabpanels in the DOM
         // (the inactive one only has `hidden=""`), so unscoped selectors mix
@@ -770,40 +774,50 @@ void (async () => {
             }
         };
 
-        // `page` is already navigated by Crawlee to request.url (primary URL).
-        const primaryIsNegative = request.url === negativeUrl;
-        const secondaryUrl = primaryIsNegative ? positiveUrl : negativeUrl;
-        const primaryLabel = primaryIsNegative ? 'ITEM_NEGATIVE_REVIEWS' : 'ITEM_POSITIVE_REVIEWS';
-        const secondaryLabel = primaryIsNegative ? 'ITEM_POSITIVE_REVIEWS' : 'ITEM_NEGATIVE_REVIEWS';
+        // `page` is already navigated by Crawlee to request.url (primary URL);
+        // the other one or two feedback types are scraped on secondary pages
+        // opened in the same browser context so all run concurrently.
+        const feedbackTypes: { type: 'negative' | 'positive' | 'neutral'; url: string | null | undefined }[] = [
+            { type: 'negative', url: negativeUrl },
+            { type: 'positive', url: positiveUrl },
+            { type: 'neutral', url: neutralUrl },
+        ];
+        const primaryType = feedbackTypes.find(t => t.url === request.url)?.type
+            ?? feedbackTypes.find(t => t.url)!.type;
+        const samplesByType: Record<'negative' | 'positive' | 'neutral', ReviewSample[]> = {
+            negative: [], positive: [], neutral: []
+        };
 
-        let secondaryPage: Page | null = null;
+        const secondaryPages: Page[] = [];
         try {
-            const tasks = [scrapeSamples(page, primaryLabel)];
-            if (secondaryUrl) {
-                secondaryPage = await page.context().newPage();
+            const tasks: Promise<void>[] = [
+                scrapeSamples(page, `ITEM_${primaryType.toUpperCase()}_REVIEWS`).then(r => { samplesByType[primaryType] = r; })
+            ];
+            for (const t of feedbackTypes) {
+                if (t.type === primaryType || !t.url) continue;
+                const secondaryPage = await page.context().newPage();
+                secondaryPages.push(secondaryPage);
+                const label = `ITEM_${t.type.toUpperCase()}_REVIEWS`;
                 tasks.push(
-                    secondaryPage.goto(secondaryUrl, { waitUntil: 'domcontentloaded', timeout: 30000 })
-                        .then(async () => scrapeSamples(secondaryPage!, secondaryLabel))
+                    secondaryPage.goto(t.url, { waitUntil: 'domcontentloaded', timeout: 30000 })
+                        .then(async () => { samplesByType[t.type] = await scrapeSamples(secondaryPage, label); })
                         .catch((err: unknown) => {
-                            log.error(`${secondaryLabel} navigation failed`, { url: secondaryUrl, error: (err as Error).message });
-                            return [];
+                            log.error(`${label} navigation failed`, { url: t.url, error: (err as Error).message });
                         })
                 );
             }
-            const [primarySamples, secondarySamples = []] = await Promise.all(tasks);
+            await Promise.all(tasks);
             phase('parallel review pages scraped');
 
-            const negativeSamples = primaryIsNegative ? primarySamples : secondarySamples;
-            const positiveSamples = primaryIsNegative ? secondarySamples : primarySamples;
-
-            scrappedItem.product!.reviewsSummary.negativeReviewSamples = negativeSamples;
-            scrappedItem.product!.reviewsSummary.positiveReviewSamples = positiveSamples;
-            log.info(`ITEM_REVIEWS: negative=${negativeSamples.length}, positive=${positiveSamples.length}`);
+            scrappedItem.product!.reviewsSummary.negativeReviewSamples = samplesByType.negative;
+            scrappedItem.product!.reviewsSummary.positiveReviewSamples = samplesByType.positive;
+            scrappedItem.product!.reviewsSummary.neutralReviewSamples = samplesByType.neutral;
+            log.info(`ITEM_REVIEWS: negative=${samplesByType.negative.length}, positive=${samplesByType.positive.length}, neutral=${samplesByType.neutral.length}`);
 
             await chainToSeller(scrappedItem, log);
             phase('ITEM_REVIEWS handler done (chained to seller)');
         } finally {
-            if (secondaryPage) await secondaryPage.close().catch(() => {});
+            for (const p of secondaryPages) await p.close().catch(() => {});
         }
     });
 
@@ -1089,12 +1103,13 @@ void (async () => {
                     if (total > 0) positivePercent = Math.round((summary.positive / total) * 10000) / 100;
                 }
 
-                const feedbackLinks: { negative: string | null; positive: string | null } = { negative: null, positive: null };
+                const feedbackLinks: { negative: string | null; positive: string | null; neutral: string | null } = { negative: null, positive: null, neutral: null };
                 document.querySelectorAll('.rating-element').forEach(el => {
                     const label = el.querySelector(':scope > span')?.textContent?.trim().toLowerCase();
                     const href = el.querySelector('a')?.href;
                     if (label === 'negative' && href) feedbackLinks.negative = href;
                     else if (label === 'positive' && href) feedbackLinks.positive = href;
+                    else if (label === 'neutral' && href) feedbackLinks.neutral = href;
                 });
 
                 const logoUrl = (document.querySelector('img.str-header__logo--img') as HTMLImageElement | null)?.src || null;
@@ -1196,8 +1211,8 @@ void (async () => {
             };
             phase('about tab extracted');
 
-            if (feedbackLinks.negative || feedbackLinks.positive) {
-                const primary = feedbackLinks.negative || feedbackLinks.positive;
+            if (feedbackLinks.negative || feedbackLinks.positive || feedbackLinks.neutral) {
+                const primary = feedbackLinks.negative || feedbackLinks.positive || feedbackLinks.neutral;
                 await crawler.addRequests([{
                     url: primary!,
                     label: "SELLER_REVIEWS",
@@ -1205,6 +1220,7 @@ void (async () => {
                         scrappedItem,
                         negativeUrl: feedbackLinks.negative || null,
                         positiveUrl: feedbackLinks.positive || null,
+                        neutralUrl: feedbackLinks.neutral || null,
                     }
                 }]);
             } else {
@@ -1228,7 +1244,7 @@ void (async () => {
         const userData = request.userData as RequestUserData;
         const scrappedItem = userData.scrappedItem!;
         const seller = scrappedItem.seller!;
-        const { negativeUrl, positiveUrl } = userData;
+        const { negativeUrl, positiveUrl, neutralUrl } = userData;
 
         const scrapeSamples = async (p: Page, label: string) => {
             try {
@@ -1301,39 +1317,47 @@ void (async () => {
             }
         };
 
-        const primaryIsNegative = request.url === negativeUrl;
-        const secondaryUrl = primaryIsNegative ? positiveUrl : negativeUrl;
-        const primaryLabel = primaryIsNegative ? 'SELLER_NEGATIVE_REVIEWS' : 'SELLER_POSITIVE_REVIEWS';
-        const secondaryLabel = primaryIsNegative ? 'SELLER_POSITIVE_REVIEWS' : 'SELLER_NEGATIVE_REVIEWS';
+        const feedbackTypes: { type: 'negative' | 'positive' | 'neutral'; url: string | null | undefined }[] = [
+            { type: 'negative', url: negativeUrl },
+            { type: 'positive', url: positiveUrl },
+            { type: 'neutral', url: neutralUrl },
+        ];
+        const primaryType = feedbackTypes.find(t => t.url === request.url)?.type
+            ?? feedbackTypes.find(t => t.url)!.type;
+        const samplesByType: Record<'negative' | 'positive' | 'neutral', ReviewSample[]> = {
+            negative: [], positive: [], neutral: []
+        };
 
-        let secondaryPage: Page | null = null;
+        const secondaryPages: Page[] = [];
         try {
-            const tasks = [scrapeSamples(page, primaryLabel)];
-            if (secondaryUrl) {
-                secondaryPage = await page.context().newPage();
+            const tasks: Promise<void>[] = [
+                scrapeSamples(page, `SELLER_${primaryType.toUpperCase()}_REVIEWS`).then(r => { samplesByType[primaryType] = r; })
+            ];
+            for (const t of feedbackTypes) {
+                if (t.type === primaryType || !t.url) continue;
+                const secondaryPage = await page.context().newPage();
+                secondaryPages.push(secondaryPage);
+                const label = `SELLER_${t.type.toUpperCase()}_REVIEWS`;
                 tasks.push(
-                    secondaryPage.goto(secondaryUrl, { waitUntil: 'domcontentloaded', timeout: 40000 })
-                        .then(async () => scrapeSamples(secondaryPage!, secondaryLabel))
+                    secondaryPage.goto(t.url, { waitUntil: 'domcontentloaded', timeout: 40000 })
+                        .then(async () => { samplesByType[t.type] = await scrapeSamples(secondaryPage, label); })
                         .catch((err: unknown) => {
-                            log.error(`${secondaryLabel} navigation failed`, { url: secondaryUrl, error: (err as Error).message });
-                            return [];
+                            log.error(`${label} navigation failed`, { url: t.url, error: (err as Error).message });
                         })
                 );
             }
-            const [primarySamples, secondarySamples = []] = await Promise.all(tasks);
+            await Promise.all(tasks);
             phase('parallel review pages scraped');
 
-            const negativeSamples = primaryIsNegative ? primarySamples : secondarySamples;
-            const positiveSamples = primaryIsNegative ? secondarySamples : primarySamples;
-
-            seller.feedback.negativeReviewSamples = negativeSamples;
-            seller.feedback.positiveReviewSamples = positiveSamples;
-            log.info(`SELLER_REVIEWS: negative=${negativeSamples.length}, positive=${positiveSamples.length}`);
+            seller.feedback.negativeReviewSamples = samplesByType.negative;
+            seller.feedback.positiveReviewSamples = samplesByType.positive;
+            seller.feedback.neutralReviewSamples = samplesByType.neutral;
+            log.info(`SELLER_REVIEWS: negative=${samplesByType.negative.length}, positive=${samplesByType.positive.length}, neutral=${samplesByType.neutral.length}`);
 
             await Dataset.pushData(scrappedItem);
             phase('SELLER_REVIEWS handler done (data pushed)');
         } finally {
-            if (secondaryPage) await secondaryPage.close().catch(() => {});
+            for (const p of secondaryPages) await p.close().catch(() => {});
         }
     });
 

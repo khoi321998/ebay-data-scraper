@@ -25,6 +25,7 @@ export interface SellerFeedback {
     detailedRatings: DetailedRatings;
     negativeReviewSamples: ReviewSample[];
     positiveReviewSamples: ReviewSample[];
+    neutralReviewSamples: ReviewSample[];
 }
 
 export interface SellerAbout {

@@ -31,6 +31,7 @@ export interface ReviewsSummary {
     ratingBreakdown: Record<number, number>;
     negativeReviewSamples: ReviewSample[];
     positiveReviewSamples: ReviewSample[];
+    neutralReviewSamples: ReviewSample[];
 }
 
 export interface Product {

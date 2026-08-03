@@ -25,4 +25,5 @@ export interface RequestUserData {
     sellerBaseUrl?: string;
     negativeUrl?: string | null;
     positiveUrl?: string | null;
+    neutralUrl?: string | null;
 }
