@@ -21,7 +21,8 @@
                     "seller.displayName",
                     "seller.ebayUsername",
                     "seller.feedbackScore",
-                    "seller.positivePercent"
+                    "seller.positivePercent",
+                    "extraction.status"
                 ]
             },
             "display": {
@@ -90,6 +91,53 @@
                     "seller.positivePercent": {
                         "label": "Positive %",
                         "format": "number"
+                    },
+                    "extraction.status": {
+                        "label": "Extraction",
+                        "format": "text"
+                    }
+                }
+            }
+        },
+        "extractionHealth": {
+            "title": "Extraction health",
+            "description": "Which expected fields came back absent. A row that is not `ok` usually means an eBay markup change broke a selector.",
+            "transformation": {
+                "fields": [
+                    "url",
+                    "captureMode",
+                    "extraction.status",
+                    "extraction.missingFields",
+                    "extraction.checkedFields",
+                    "extraction.errors"
+                ]
+            },
+            "display": {
+                "component": "table",
+                "properties": {
+                    "url": {
+                        "label": "URL",
+                        "format": "link"
+                    },
+                    "captureMode": {
+                        "label": "Mode",
+                        "format": "text"
+                    },
+                    "extraction.status": {
+                        "label": "Status",
+                        "format": "text"
+                    },
+                    "extraction.missingFields": {
+                        "label": "Missing fields",
+                        "format": "array"
+                    },
+                    "extraction.checkedFields": {
+                        "label": "Fields checked",
+                        "format": "number"
+                    },
+                    "extraction.errors": {
+                        "label": "Errors",
+                        "format": "array"
                     }
                 }
             }

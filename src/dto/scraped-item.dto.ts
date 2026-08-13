@@ -1,3 +1,4 @@
+import type { ExtractionReport } from './extraction.dto.js';
 import type { CaptureMode } from './input.dto.js';
 import type { Product } from './product.dto.js';
 import type { SellerRef, SellerSection } from './seller.dto.js';
@@ -17,6 +18,8 @@ export interface ScrapedItem {
     seller: SellerSection | null;
     technical: Technical | null;
     sellerTechnical: SellerTechnical | null;
+    /** Which expected fields came back absent — see `extraction.dto.ts`. */
+    extraction: ExtractionReport;
 }
 
 /** Shape of `request.userData` passed between crawler handlers. */

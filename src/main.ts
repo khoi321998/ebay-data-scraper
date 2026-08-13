@@ -38,8 +38,25 @@ import type {
     ShippingOption,
     Specification,
 } from "./dto/index.js";
+import {
+    auditExtraction,
+    emptyExtractionReport,
+    logExtractionReport,
+    recordExtractionError,
+    SCRAPED_ITEM_CHECKS,
+} from "./extraction-audit.js";
 
 const en = JSON.parse(fsSync.readFileSync('./node_modules/i18n-iso-countries/langs/en.json', 'utf8'));
+
+/**
+ * Single exit point for the dataset: audits the record against SCRAPED_ITEM_CHECKS so a silent
+ * selector break shows up as `extraction.missingFields` instead of an unexplained `null`.
+ */
+async function pushScrapedItem(scrappedItem: ScrapedItem, log: Log): Promise<void> {
+    scrappedItem.extraction = auditExtraction(scrappedItem, SCRAPED_ITEM_CHECKS, scrappedItem.extraction);
+    logExtractionReport(scrappedItem.extraction, log, scrappedItem.url);
+    await Dataset.pushData(scrappedItem);
+}
 countries.registerLocale(en);
 
 function parseCurrency(input: string | null | undefined): ParsedCurrency | null {
@@ -159,7 +176,8 @@ void (async () => {
                 sellerRef: null,
                 seller: emptySellerSection(),
                 technical: null,
-                sellerTechnical: null
+                sellerTechnical: null,
+                extraction: emptyExtractionReport()
             };
             seed.seller.profileUrl = trimmed;
             const slugMatch = trimmed.match(/\/(?:str|usr)\/([^/?]+)/i);
@@ -323,14 +341,13 @@ void (async () => {
         const {url} = request;
         // platformItemId already extracted at handler start (above) for parallel description fetch
 
-        const mpn = $('dl.ux-labels-values--mpn dd.ux-labels-values__values span.ux-textspans').text().trim() || null;
-        const upc = $('dl.ux-labels-values--upc dd.ux-labels-values__values span.ux-textspans').text().trim() || null;
-        const ean = $('dl.ux-labels-values--ean dd.ux-labels-values__values span.ux-textspans').text().trim() || null;
-        const gtin = upc || ean || null;
-        const modelNumber = $('dl.ux-labels-values--model dd.ux-labels-values__values span.ux-textspans').text().trim() || null;
+        let mpn = $('dl.ux-labels-values--mpn dd.ux-labels-values__values span.ux-textspans').text().trim() || null;
+        let upc = $('dl.ux-labels-values--upc dd.ux-labels-values__values span.ux-textspans').text().trim() || null;
+        let ean = $('dl.ux-labels-values--ean dd.ux-labels-values__values span.ux-textspans').text().trim() || null;
+        let modelNumber = $('dl.ux-labels-values--model dd.ux-labels-values__values span.ux-textspans').text().trim() || null;
         const title = $('h1[class="x-item-title__mainTitle"]').text().trim();
         const brandEl = $('dl.ux-labels-values--brand dd');
-        const brand = brandEl.length ? brandEl.text().trim() || null : null;
+        let brand = brandEl.length ? brandEl.text().trim() || null : null;
 
         const scriptContent = $('script')
             .filter((i, el) => ($(el).html() || "").includes('Object.assign($i18n=window.$i18n'))
@@ -408,7 +425,12 @@ void (async () => {
             .replace("See details- for more information about returns", "").trim();
 
         const specifications: Specification[] = [];
-        $('dl[data-testid="ux-labels-values"]').each((i, el) => {
+        const seenSpecs = new Set<string>();
+        // Two layouts in the wild: the legacy one puts every pair in its own
+        // `dl[data-testid="ux-labels-values"]`, the newer "evo" one puts them all in a single
+        // `dl.ux-layout-section-evo__item` split into `.ux-layout-section-evo__col` cells.
+        // The dt/dd class names are identical in both, so one pass over either row container works.
+        $('dl[data-testid="ux-labels-values"], .x-about-this-item .ux-layout-section-evo__col').each((i, el) => {
             const name = $(el).find('dt.ux-labels-values__labels').text().replace(/\s+/g, ' ').trim();
             // Clone the value cell and strip the collapsed hidden duplicate, screen-reader-only
             // (.clipped) text, and inline actions — e.g. Condition's "Read more" / "See all
@@ -416,8 +438,20 @@ void (async () => {
             const $value = $(el).find('dd.ux-labels-values__values').clone();
             $value.find('[aria-hidden="true"], .clipped, [data-testid="ux-action"]').remove();
             const value = $value.text().replace(/\s+/g, ' ').trim();
-            if (name && value) specifications.push({ name, value });
+            if (!name || !value || seenSpecs.has(name.toLowerCase())) return;
+            seenSpecs.add(name.toLowerCase());
+            specifications.push({ name, value });
         });
+
+        // The evo layout dropped the `ux-labels-values--<field>` modifier classes the selectors
+        // above rely on, so fall back to the parsed specifics table for the identity fields.
+        const specValue = (label: string) => specifications.find(s => s.name.toLowerCase() === label)?.value || null;
+        brand ??= specValue('brand');
+        mpn ??= specValue('mpn');
+        upc ??= specValue('upc');
+        ean ??= specValue('ean');
+        modelNumber ??= specValue('model');
+        const gtin = upc || ean || null;
 
         let itemLocationText = $('div.ux-labels-values--shipping').find('span.ux-textspans.ux-textspans--SECONDARY').text().trim() || null;
         let itemCountryCode: string | null = null;
@@ -626,7 +660,9 @@ void (async () => {
             //     experimentIds: [], trackingIds: { googleAnalytics, facebookPixel },
             //     pageContext, fulfilmentCodes: [], jsBundles, cssBundles, apiEndpoints
             // },
-            sellerTechnical: null
+            sellerTechnical: null,
+            // Filled in by pushScrapedItem() once every handler has had its turn.
+            extraction: emptyExtractionReport()
         };
 
         // Seed the seller section with what we already know from the product page
@@ -680,6 +716,9 @@ void (async () => {
             scrappedItem.product!.description.plainText = $desc('body').text().replace(/\s+/g, ' ').trim();
         } else if (descRes) {
             log.warning(`DESCRIPTION fetch ${descRes.statusCode}`, { itemId: platformItemId });
+            recordExtractionError(scrappedItem, 'DESCRIPTION', `iframe fetch returned ${descRes.statusCode}`);
+        } else {
+            recordExtractionError(scrappedItem, 'DESCRIPTION', 'iframe fetch failed or item id unresolved');
         }
         phase('description awaited (parallel got)');
 
@@ -828,13 +867,14 @@ void (async () => {
     // Otherwise, go straight to SELLER_STORE.
     async function chainToSeller(scrappedItem: ScrapedItem, log: Log) {
         if (mode === 'product_only') {
-            await Dataset.pushData(scrappedItem);
+            await pushScrapedItem(scrappedItem, log);
             return;
         }
         const sellerUrl = scrappedItem.seller?.profileUrl;
         if (!sellerUrl) {
             log.warning('No seller profileUrl found on product page, pushing product-only data');
-            await Dataset.pushData(scrappedItem);
+            recordExtractionError(scrappedItem, 'ITEM', 'no seller profileUrl on product page, seller flow skipped');
+            await pushScrapedItem(scrappedItem, log);
             return;
         }
         let isHub = false;
@@ -910,7 +950,8 @@ void (async () => {
 
             if (!sellerUrl) {
                 log.warning(`SELLER_HUB: could not resolve real seller URL, pushing product-only data`, { url: request.url });
-                await Dataset.pushData(scrappedItem);
+                recordExtractionError(scrappedItem, 'SELLER_HUB', 'could not resolve real seller URL, seller flow skipped');
+                await pushScrapedItem(scrappedItem, log);
                 return;
             }
 
@@ -1225,7 +1266,8 @@ void (async () => {
                 }]);
             } else {
                 log.warning('No seller feedback link found, pushing data');
-                await Dataset.pushData(scrappedItem);
+                recordExtractionError(scrappedItem, 'SELLER_STORE', 'no seller feedback link found, review samples skipped');
+                await pushScrapedItem(scrappedItem, log);
             }
             phase('SELLER_STORE handler done');
         } catch (err) {
@@ -1354,7 +1396,7 @@ void (async () => {
             seller.feedback.neutralReviewSamples = samplesByType.neutral;
             log.info(`SELLER_REVIEWS: negative=${samplesByType.negative.length}, positive=${samplesByType.positive.length}, neutral=${samplesByType.neutral.length}`);
 
-            await Dataset.pushData(scrappedItem);
+            await pushScrapedItem(scrappedItem, log);
             phase('SELLER_REVIEWS handler done (data pushed)');
         } finally {
             for (const p of secondaryPages) await p.close().catch(() => {});

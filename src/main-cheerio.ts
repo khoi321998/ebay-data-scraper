@@ -16,8 +16,32 @@ import { Actor } from "apify";
 import { CheerioCrawler, Dataset } from "crawlee";
 
 import type { ActorInput, CaptureMode, ParsedCurrency, Specification } from "./dto/index.js";
+import { auditExtraction, emptyExtractionReport, type FieldCheck, logExtractionReport } from "./extraction-audit.js";
 
 const VALID_MODES = ["product_only", "seller_only", "product_and_seller"];
+
+// This script pushes its own flat benchmark shape (not ScrapedItem), so it declares its own
+// expectations. Same intent as SCRAPED_ITEM_CHECKS: a selector that stops matching shows up
+// as `extraction.missingFields` instead of a silent null.
+const CHEERIO_ITEM_CHECKS: FieldCheck[] = [
+    { path: "product.id.platformItemId", severity: "critical", selector: "URL /itm/{id}" },
+    { path: "product.title", severity: "critical", selector: "h1.x-item-title__mainTitle" },
+    { path: "product.pricing.priceMin", severity: "critical", selector: "div.x-price-primary span.ux-textspans" },
+    { path: "product.pricing.currency", severity: "warning", selector: "div.x-price-primary span.ux-textspans" },
+    { path: "product.specifications", severity: "warning", selector: 'dl[data-testid="ux-labels-values"] | .x-about-this-item .ux-layout-section-evo__col' },
+    { path: "product.brand", severity: "warning", selector: 'dl.ux-labels-values--brand dd | specifics "Brand"' },
+    { path: "product.category.breadcrumb", severity: "warning", selector: "a.seo-breadcrumb-text" },
+    { path: "product.condition.conditionText", severity: "warning", selector: "div.x-item-condition-text span.ux-textspans" },
+    { path: "product.media.images", severity: "warning", selector: "i18n script blob → VIImageType" },
+    { path: "sellerRef.displayName", severity: "warning", selector: ".x-sellercard-atf__info__about-seller a .ux-textspans--BOLD", when: (r) => r.sellerRef != null },
+];
+
+const CHEERIO_SELLER_CHECKS: FieldCheck[] = [
+    { path: "seller.displayName", severity: "critical", selector: ".str-seller-card__store-name h1" },
+    { path: "seller.ebayUsername", severity: "warning", selector: "URL /str|/usr slug" },
+    { path: "seller.itemsSold", severity: "warning" },
+    { path: "seller.storeItems", severity: "warning", selector: ".str-item-card" },
+];
 
 function parseCurrency(input: string | null | undefined): ParsedCurrency | null {
     if (!input) return null;
@@ -145,11 +169,10 @@ void (async () => {
         const platformItemId = platformMatch ? platformMatch[1] : null;
 
         const title = $("h1.x-item-title__mainTitle").text().trim() || null;
-        const brand = $("dl.ux-labels-values--brand dd").text().trim() || null;
-        const mpn = $("dl.ux-labels-values--mpn dd.ux-labels-values__values span.ux-textspans").text().trim() || null;
-        const upc = $("dl.ux-labels-values--upc dd.ux-labels-values__values span.ux-textspans").text().trim() || null;
-        const ean = $("dl.ux-labels-values--ean dd.ux-labels-values__values span.ux-textspans").text().trim() || null;
-        const gtin = upc || ean || null;
+        let brand = $("dl.ux-labels-values--brand dd").text().trim() || null;
+        let mpn = $("dl.ux-labels-values--mpn dd.ux-labels-values__values span.ux-textspans").text().trim() || null;
+        let upc = $("dl.ux-labels-values--upc dd.ux-labels-values__values span.ux-textspans").text().trim() || null;
+        let ean = $("dl.ux-labels-values--ean dd.ux-labels-values__values span.ux-textspans").text().trim() || null;
 
         const rawPriceTexts: string[] = [];
         $("div.x-price-primary span.ux-textspans").each((_i, el) => { rawPriceTexts.push($(el).text().trim()); });
@@ -187,7 +210,12 @@ void (async () => {
             $("div.ux-labels-values--shipping span.ux-textspans.ux-textspans--SECONDARY").text().trim() || null;
 
         const specifications: Specification[] = [];
-        $('dl[data-testid="ux-labels-values"]').each((_i, el) => {
+        const seenSpecs = new Set<string>();
+        // Two layouts in the wild: the legacy one puts every pair in its own
+        // `dl[data-testid="ux-labels-values"]`, the newer "evo" one puts them all in a single
+        // `dl.ux-layout-section-evo__item` split into `.ux-layout-section-evo__col` cells.
+        // The dt/dd class names are identical in both, so one pass over either row container works.
+        $('dl[data-testid="ux-labels-values"], .x-about-this-item .ux-layout-section-evo__col').each((_i, el) => {
             const name = $(el).find("dt.ux-labels-values__labels").text().replace(/\s+/g, " ").trim();
             // Clone the value cell and strip the collapsed hidden duplicate, screen-reader-only
             // (.clipped) text, and inline actions — e.g. Condition's "Read more" / "See all
@@ -195,8 +223,20 @@ void (async () => {
             const $value = $(el).find("dd.ux-labels-values__values").clone();
             $value.find('[aria-hidden="true"], .clipped, [data-testid="ux-action"]').remove();
             const value = $value.text().replace(/\s+/g, " ").trim();
-            if (name && value) specifications.push({ name, value });
+            if (!name || !value || seenSpecs.has(name.toLowerCase())) return;
+            seenSpecs.add(name.toLowerCase());
+            specifications.push({ name, value });
         });
+
+        // The evo layout dropped the `ux-labels-values--<field>` modifier classes the selectors
+        // above rely on, so fall back to the parsed specifics table for the identity fields.
+        const specValue = (label: string) =>
+            specifications.find((s) => s.name.toLowerCase() === label)?.value || null;
+        brand ??= specValue("brand");
+        mpn ??= specValue("mpn");
+        upc ??= specValue("upc");
+        ean ??= specValue("ean");
+        const gtin = upc || ean || null;
 
         // Seller info from product page
         const sellerAnchor = $(".x-sellercard-atf__info__about-seller a");
@@ -251,7 +291,10 @@ void (async () => {
                 mode === "product_only"
                     ? null
                     : { profileUrl: sellerProfileUrl, displayName: sellerDisplayName, ebayUsername },
+            extraction: emptyExtractionReport(),
         };
+        item.extraction = auditExtraction(item, CHEERIO_ITEM_CHECKS);
+        logExtractionReport(item.extraction, log, request.url);
 
         itemsPushed++;
         await Dataset.pushData(item);
@@ -398,7 +441,10 @@ void (async () => {
                 followers,
                 storeItems,
             },
+            extraction: emptyExtractionReport(),
         };
+        sellerData.extraction = auditExtraction(sellerData, CHEERIO_SELLER_CHECKS);
+        logExtractionReport(sellerData.extraction, log, request.url);
 
         if (mode === "seller_only") {
             itemsPushed++;
