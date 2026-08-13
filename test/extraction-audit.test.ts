@@ -1,12 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import {
-    auditExtraction,
-    emptyExtractionReport,
-    type FieldCheck,
-    recordExtractionError,
-    SCRAPED_ITEM_CHECKS,
-} from '../src/extraction-audit.js';
+import { auditExtraction, type FieldCheck, SCRAPED_ITEM_CHECKS } from '../src/extraction-audit.js';
 
 const checks: FieldCheck[] = [
     { path: 'product.title', severity: 'critical' },
@@ -37,17 +31,21 @@ describe('auditExtraction', () => {
         const report = auditExtraction({ ...healthy, product: { ...healthy.product, specifications: [] } }, checks);
         expect(report.status).toBe('degraded');
         expect(report.missingFields).toEqual(['product.specifications']);
-        expect(report.issues[0]).toMatchObject({
-            reason: 'empty',
-            severity: 'warning',
-            selector: 'dl[data-testid="ux-labels-values"]',
-        });
+        // An issue carries only the field and the hook to fix — nothing else.
+        expect(report.issues).toEqual([
+            { field: 'product.specifications', selector: 'dl[data-testid="ux-labels-values"]' },
+        ]);
+    });
+
+    it('omits `selector` entirely for a check that declares none', () => {
+        const report = auditExtraction({ ...healthy, product: { ...healthy.product, title: '' } }, checks);
+        expect(report.issues).toEqual([{ field: 'product.title' }]);
     });
 
     it('escalates to broken when a critical field is absent', () => {
         const report = auditExtraction({ ...healthy, product: { ...healthy.product, title: '' } }, checks);
         expect(report.status).toBe('broken');
-        expect(report.issues.find((i) => i.field === 'product.title')?.severity).toBe('critical');
+        expect(report.missingFields).toContain('product.title');
     });
 
     it('skips checks whose `when` gate is closed, and applies them when open', () => {
@@ -62,14 +60,6 @@ describe('auditExtraction', () => {
         expect(report.missingFields).toEqual(['product.title', 'product.specifications', 'product.stock.soldCount']);
     });
 
-    it('carries over errors recorded by earlier handlers and degrades on them alone', () => {
-        const target = { ...healthy, extraction: emptyExtractionReport() };
-        recordExtractionError(target, 'DESCRIPTION', new Error('iframe fetch failed'));
-        const report = auditExtraction(target, checks, target.extraction);
-        expect(report.status).toBe('degraded');
-        expect(report.missingFields).toEqual([]);
-        expect(report.errors).toEqual([{ stage: 'DESCRIPTION', message: 'iframe fetch failed' }]);
-    });
 });
 
 describe('SCRAPED_ITEM_CHECKS', () => {

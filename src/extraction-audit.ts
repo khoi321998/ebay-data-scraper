@@ -7,6 +7,10 @@ someone reads the dataset. Rather than sprinkling checks through the handlers, e
 expect to find is declared once in a table below, and the assembled record is walked against that
 table right before it is pushed.
 
+The pushed report is deliberately thin — status, counts, and `{ field, selector }` per issue. It
+answers "what stopped matching, and where do I fix it?"; anything beyond that (why a fetch failed,
+which handler skipped a step) belongs in the run log, not on every record.
+
 Adding a field to watch = one line in the relevant checks array. Keep `severity: 'critical'` for
 fields that cannot legitimately be absent from a live page (a listing always has a title and a
 price); everything that some listings genuinely lack belongs at `'warning'`, or stays out of the
@@ -15,7 +19,6 @@ table entirely — a check that fires on healthy pages trains everyone to ignore
 import type { Log } from 'crawlee';
 
 import type {
-    ExtractionError,
     ExtractionIssue,
     ExtractionReport,
     ExtractionSeverity,
@@ -37,7 +40,7 @@ export interface FieldCheck {
 }
 
 export function emptyExtractionReport(): ExtractionReport {
-    return { status: 'ok', checkedFields: 0, missingFields: [], issues: [], errors: [] };
+    return { status: 'ok', checkedFields: 0, missingFields: [], issues: [] };
 }
 
 function getByPath(record: unknown, path: string): unknown {
@@ -48,67 +51,46 @@ function getByPath(record: unknown, path: string): unknown {
 }
 
 /**
- * `null`/`undefined` → missing. Blank strings, empty arrays and empty plain objects → empty.
- * `0` and `false` are real values (a listing can have 0 sold) and never count as absent.
+ * Absent = `null`/`undefined`/`NaN`, or a blank string, empty array or empty plain object — a dead
+ * selector produces any of these depending on how the call site defaults. `0` and `false` are real
+ * values (a listing can have 0 sold) and never count as absent.
  */
-function classify(value: unknown): 'missing' | 'empty' | null {
-    if (value === null || value === undefined) return 'missing';
-    if (typeof value === 'string') return value.trim() ? null : 'empty';
-    if (Array.isArray(value)) return value.length ? null : 'empty';
-    if (typeof value === 'number') return Number.isNaN(value) ? 'missing' : null;
-    if (typeof value === 'object') return Object.keys(value as object).length ? null : 'empty';
-    return null;
+function isAbsent(value: unknown): boolean {
+    if (value === null || value === undefined) return true;
+    if (typeof value === 'string') return !value.trim();
+    if (Array.isArray(value)) return !value.length;
+    if (typeof value === 'number') return Number.isNaN(value);
+    if (typeof value === 'object') return !Object.keys(value as object).length;
+    return false;
 }
 
-/**
- * Walk `record` against `checks` and return the report. Pass the record's in-progress report as
- * `existing` to carry over errors recorded by earlier handlers.
- */
-export function auditExtraction(
-    record: unknown,
-    checks: FieldCheck[],
-    existing?: ExtractionReport,
-): ExtractionReport {
-    const errors: ExtractionError[] = existing?.errors ?? [];
+/** Walk `record` against `checks` and return the report. */
+export function auditExtraction(record: unknown, checks: FieldCheck[]): ExtractionReport {
     const issues: ExtractionIssue[] = [];
     let checkedFields = 0;
+    let criticalMissing = false;
 
     for (const check of checks) {
         if (check.when && !check.when((record ?? {}) as RecordLike)) continue;
         checkedFields++;
-        const reason = classify(getByPath(record, check.path));
-        if (!reason) continue;
+        if (!isAbsent(getByPath(record, check.path))) continue;
+        if (check.severity === 'critical') criticalMissing = true;
         issues.push({
             field: check.path,
-            severity: check.severity,
-            reason,
             ...(check.selector ? { selector: check.selector } : {}),
         });
     }
 
     let status: ExtractionStatus = 'ok';
-    if (issues.some((i) => i.severity === 'critical')) status = 'broken';
-    else if (issues.length || errors.length) status = 'degraded';
+    if (criticalMissing) status = 'broken';
+    else if (issues.length) status = 'degraded';
 
     return {
         status,
         checkedFields,
         missingFields: issues.map((i) => i.field),
         issues,
-        errors,
     };
-}
-
-/** Append a caught failure so it travels with the record instead of only hitting the console. */
-export function recordExtractionError(
-    target: { extraction: ExtractionReport },
-    stage: string,
-    err: unknown,
-): void {
-    target.extraction.errors.push({
-        stage,
-        message: err instanceof Error ? err.message : String(err),
-    });
 }
 
 /** Surface the report in the run log — `broken` records are worth an error-level line. */
@@ -117,12 +99,7 @@ export function logExtractionReport(report: ExtractionReport, log: Log, url: str
         log.debug(`extraction ok (${report.checkedFields} fields checked)`, { url });
         return;
     }
-    const detail = {
-        url,
-        status: report.status,
-        missingFields: report.missingFields,
-        errors: report.errors.map((e) => `${e.stage}: ${e.message}`),
-    };
+    const detail = { url, status: report.status, missingFields: report.missingFields };
     if (report.status === 'broken') {
         log.error(
             `extraction BROKEN — ${report.missingFields.length}/${report.checkedFields} expected fields absent, likely a DOM change`,

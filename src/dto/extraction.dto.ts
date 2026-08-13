@@ -13,31 +13,26 @@ export type ExtractionSeverity = 'critical' | 'warning';
 
 export type ExtractionStatus = 'ok' | 'degraded' | 'broken';
 
-/** One expected-but-absent field. */
+/**
+ * One expected-but-absent field: what is missing, and the DOM hook it should have come from.
+ *
+ * Deliberately just those two. Severity is what decides `ExtractionReport.status`, and whether
+ * the value arrived as `null` or as `''` says nothing a reader can act on — both mean the same
+ * thing (the hook stopped matching), and the fix is the same either way.
+ */
 export interface ExtractionIssue {
     /** Dot path into the pushed record, e.g. `product.specifications`. */
     field: string;
-    severity: ExtractionSeverity;
-    /** Why it was flagged — `missing` (null/undefined) or `empty` (blank string / empty array). */
-    reason: 'missing' | 'empty';
     /** The DOM hook the field is read from, so a broken selector is obvious from the dataset. */
     selector?: string;
 }
 
-/** A failure thrown mid-extraction (fetch error, timeout, evaluate crash). */
-export interface ExtractionError {
-    /** Handler or step that failed, e.g. `DESCRIPTION`, `SELLER_STORE`. */
-    stage: string;
-    message: string;
-}
-
 export interface ExtractionReport {
-    /** `broken` if any critical field is absent, `degraded` if only warnings/errors, else `ok`. */
+    /** `broken` if any critical field is absent, `degraded` if only warnings, else `ok`. */
     status: ExtractionStatus;
     /** How many declared checks actually applied to this record (mode-dependent). */
     checkedFields: number;
     /** Flat list of absent field paths — the quick "what did the DOM change break?" view. */
     missingFields: string[];
     issues: ExtractionIssue[];
-    errors: ExtractionError[];
 }

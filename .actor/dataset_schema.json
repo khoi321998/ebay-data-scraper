@@ -108,8 +108,7 @@
                     "captureMode",
                     "extraction.status",
                     "extraction.missingFields",
-                    "extraction.checkedFields",
-                    "extraction.errors"
+                    "extraction.checkedFields"
                 ]
             },
             "display": {
@@ -134,10 +133,6 @@
                     "extraction.checkedFields": {
                         "label": "Fields checked",
                         "format": "number"
-                    },
-                    "extraction.errors": {
-                        "label": "Errors",
-                        "format": "array"
                     }
                 }
             }

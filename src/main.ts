@@ -42,7 +42,6 @@ import {
     auditExtraction,
     emptyExtractionReport,
     logExtractionReport,
-    recordExtractionError,
     SCRAPED_ITEM_CHECKS,
 } from "./extraction-audit.js";
 
@@ -53,7 +52,7 @@ const en = JSON.parse(fsSync.readFileSync('./node_modules/i18n-iso-countries/lan
  * selector break shows up as `extraction.missingFields` instead of an unexplained `null`.
  */
 async function pushScrapedItem(scrappedItem: ScrapedItem, log: Log): Promise<void> {
-    scrappedItem.extraction = auditExtraction(scrappedItem, SCRAPED_ITEM_CHECKS, scrappedItem.extraction);
+    scrappedItem.extraction = auditExtraction(scrappedItem, SCRAPED_ITEM_CHECKS);
     logExtractionReport(scrappedItem.extraction, log, scrappedItem.url);
     await Dataset.pushData(scrappedItem);
 }
@@ -716,9 +715,8 @@ void (async () => {
             scrappedItem.product!.description.plainText = $desc('body').text().replace(/\s+/g, ' ').trim();
         } else if (descRes) {
             log.warning(`DESCRIPTION fetch ${descRes.statusCode}`, { itemId: platformItemId });
-            recordExtractionError(scrappedItem, 'DESCRIPTION', `iframe fetch returned ${descRes.statusCode}`);
         } else {
-            recordExtractionError(scrappedItem, 'DESCRIPTION', 'iframe fetch failed or item id unresolved');
+            log.warning('DESCRIPTION iframe fetch failed or item id unresolved', { itemId: platformItemId });
         }
         phase('description awaited (parallel got)');
 
@@ -873,7 +871,6 @@ void (async () => {
         const sellerUrl = scrappedItem.seller?.profileUrl;
         if (!sellerUrl) {
             log.warning('No seller profileUrl found on product page, pushing product-only data');
-            recordExtractionError(scrappedItem, 'ITEM', 'no seller profileUrl on product page, seller flow skipped');
             await pushScrapedItem(scrappedItem, log);
             return;
         }
@@ -950,7 +947,6 @@ void (async () => {
 
             if (!sellerUrl) {
                 log.warning(`SELLER_HUB: could not resolve real seller URL, pushing product-only data`, { url: request.url });
-                recordExtractionError(scrappedItem, 'SELLER_HUB', 'could not resolve real seller URL, seller flow skipped');
                 await pushScrapedItem(scrappedItem, log);
                 return;
             }
@@ -1266,7 +1262,6 @@ void (async () => {
                 }]);
             } else {
                 log.warning('No seller feedback link found, pushing data');
-                recordExtractionError(scrappedItem, 'SELLER_STORE', 'no seller feedback link found, review samples skipped');
                 await pushScrapedItem(scrappedItem, log);
             }
             phase('SELLER_STORE handler done');
