@@ -14,11 +14,11 @@
         "startUrls": {
             "title": "Start URLs",
             "type": "array",
-            "description": "URLs to start scraping from. For product modes, use item URLs (e.g., https://www.ebay.com/itm/...). For seller_only, use seller store/profile URLs (e.g., https://www.ebay.com/str/... or https://www.ebay.com/usr/...).",
+            "description": "URLs to start scraping from. For product modes, use item URLs (e.g., https://www.ebay.com/itm/...). For seller_only, use seller store/profile URLs (e.g., https://www.ebay.com/str/... or https://www.ebay.com/usr/...).\n\nAny eBay marketplace works — ebay.com, ebay.es, ebay.de, ebay.co.uk, ebay.com.au and so on. The scraper stays on the domain you give it: the page is scraped in that site's language, prices come back in that marketplace's currency, and the proxy exits in that country.",
             "editor": "stringList",
             "items": {
                 "type": "string",
-                "pattern": "^https?://"
+                "pattern": "^https?://([a-z0-9-]+\\.)*ebay\\.[a-z.]+/"
             },
             "default": ["https://www.ebay.com/itm/123456789"],
             "prefill": ["https://www.ebay.com/itm/123456789"]

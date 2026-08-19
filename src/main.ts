@@ -19,7 +19,7 @@ import 'dotenv/config';
 
 import { Actor } from 'apify';
 import * as cheerio from "cheerio";
-import { Dataset, type Log,PlaywrightCrawler } from "crawlee";
+import { Dataset, type Log,PlaywrightCrawler, ProxyConfiguration } from "crawlee";
 import fsSync from "fs";
 import fs from "fs/promises";
 import got from "got";
@@ -39,11 +39,18 @@ import type {
     Specification,
 } from "./dto/index.js";
 import {
+    acceptLanguageFor,
+    DEFAULT_SITE,
+    isEbayUrl,
+    siteFor,
+} from "./ebay-sites.js";
+import {
     auditExtraction,
     emptyExtractionReport,
     logExtractionReport,
     SCRAPED_ITEM_CHECKS,
 } from "./extraction-audit.js";
+import { parseCurrency } from "./parse-currency.js";
 
 const en = JSON.parse(fsSync.readFileSync('./node_modules/i18n-iso-countries/langs/en.json', 'utf8'));
 
@@ -57,27 +64,6 @@ async function pushScrapedItem(scrappedItem: ScrapedItem, log: Log): Promise<voi
     await Dataset.pushData(scrappedItem);
 }
 countries.registerLocale(en);
-
-function parseCurrency(input: string | null | undefined): ParsedCurrency | null {
-    if (!input) return null;
-    const currencyMap: Record<string, string> = { '$': 'USD', '€': 'EUR', '£': 'GBP', '¥': 'JPY', '₹': 'INR' };
-    const symbolMatch = input.match(/([$€£¥₹])\s*([\d,]+(?:\.\d+)?)/);
-    if (symbolMatch) {
-        const amount = parseFloat(symbolMatch[2].replace(/,/g, ''));
-        return { currency: currencyMap[symbolMatch[1]] || symbolMatch[1], cost: amount };
-    }
-    const isoMatch = input.match(/([A-Z]{3})\s*([\d,]+(?:\.\d+)?)/);
-    if (isoMatch) {
-        const amount = parseFloat(isoMatch[2].replace(/,/g, ''));
-        return { currency: isoMatch[1], cost: amount };
-    }
-    const isoSuffixMatch = input.match(/([\d,]+(?:\.\d+)?)\s*([A-Z]{3})/);
-    if (isoSuffixMatch) {
-        const amount = parseFloat(isoSuffixMatch[1].replace(/,/g, ''));
-        return { currency: isoSuffixMatch[2], cost: amount };
-    }
-    return null;
-}
 
 function getEstimatedDaysLeft(dateText: string): number {
     const today = new Date();
@@ -160,6 +146,15 @@ void (async () => {
         return;
     }
 
+    // eBay serves every marketplace (ebay.com, ebay.es, ebay.de, …) from the same markup, so a
+    // foreign host would silently produce an all-null record rather than an error. Reject it here.
+    const rejected = inputUrls.filter(u => !isEbayUrl(u));
+    if (rejected.length) {
+        console.error(`Not eBay URLs, ignoring: ${rejected.join(', ')}`);
+        inputUrls = inputUrls.filter(u => isEbayUrl(u));
+        if (inputUrls.length === 0) return;
+    }
+
     // Build startUrls based on mode
     let startUrls;
     if (mode === 'seller_only') {
@@ -188,26 +183,61 @@ void (async () => {
             };
         });
     } else {
-        // product_only and product_and_seller both start at ITEM
+        // product_only and product_and_seller both start at ITEM, on the caller's URL untouched.
+        //
+        // This used to append `rt=nc&_ipg=1&location=US`. All three were dropped after probing
+        // ebay.es and ebay.com on 2026-08-19:
+        //   _ipg=1    a /sch/ search param (items per page); meaningless on an item page.
+        //   location  inert — US vs DE vs absent gave byte-identical price, shipping and delivery
+        //             blocks. What drives the delivery estimate and the converted price is the
+        //             proxy exit IP, which the marketplace registry sets.
+        //   rt=nc     undocumented; present since the initial commit with no stated reason, never
+        //             emitted by eBay's own markup, and made no difference on active listings.
+        //             Folklore says "redirect type = no cache" — a guard against an ended listing
+        //             bouncing to a similar-items page — but that stayed unverified, since the
+        //             search page needed to harvest an ended item id sits behind the bot wall.
+        //             If ended listings ever start redirecting, this is the first thing to retry.
+        //
+        // Adding nothing keeps every caller param authoritative (`?var=` picks a listing variation)
+        // and lets the pushed record carry the URL the caller actually asked for.
         startUrls = inputUrls.map(url => {
-            const u = new URL(url);
-            u.searchParams.set('rt', 'nc');
-            u.searchParams.set('_ipg', '1');
-            u.searchParams.set('location', 'US');
-            console.log(`ITEM start URL: ${u.toString()}`);
+            console.log(`ITEM start URL: ${url}`);
             return {
-                url: u.toString(),
+                url,
                 label: 'ITEM',
                 userData: {}
             };
         });
     }
 
-    const proxyConfiguration = await Actor.createProxyConfiguration({
-        groups: ['RESIDENTIAL'],
-        countryCode: 'US',
-    });
-    console.log('Using Apify RESIDENTIAL proxy');
+    // ── Proxy: exit country follows the marketplace ──
+    // A US residential IP on ebay.es loads, but eBay then quotes US delivery estimates and converts
+    // prices to USD, so the record describes a listing no Spanish buyer would see. One proxy
+    // configuration per country in the run, dispatched per request by hostname.
+    const runCountries = [...new Set(startUrls.map(r => siteFor(r.url).countryCode))];
+    const proxyByCountry = new Map<string, ProxyConfiguration>();
+    for (const countryCode of runCountries) {
+        try {
+            const conf = await Actor.createProxyConfiguration({ groups: ['RESIDENTIAL'], countryCode });
+            if (conf) proxyByCountry.set(countryCode, conf);
+        } catch (err) {
+            // Not every residential country is available on every plan — fall back rather than die.
+            console.warn(`Proxy country ${countryCode} unavailable: ${(err as Error).message}`);
+        }
+    }
+    const fallbackProxy = proxyByCountry.get(DEFAULT_SITE.countryCode) ?? [...proxyByCountry.values()][0];
+
+    // Without an Apify token there is no proxy at all — keep running direct, as before.
+    const proxyConfiguration = fallbackProxy
+        ? new ProxyConfiguration({
+            newUrlFunction: async (sessionId, options) => {
+                const url = options?.request?.url;
+                const conf = (url ? proxyByCountry.get(siteFor(url).countryCode) : null) ?? fallbackProxy;
+                return (await conf.newUrl(sessionId)) ?? null;
+            },
+        })
+        : undefined;
+    console.log(`Using Apify RESIDENTIAL proxy, countries: ${[...proxyByCountry.keys()].join(', ') || 'none'}`);
 
     const crawler = new PlaywrightCrawler({
         proxyConfiguration,
@@ -223,18 +253,21 @@ void (async () => {
         ignoreIframes: true,
         launchContext: {
             launchOptions: {
-                headless: true,
+                headless: false,
                 args: ['--disable-blink-features=AutomationControlled'],
             },
         },
         preNavigationHooks: [
             async ({ page, request }) => {
-                // NOTE: do NOT use page.route() to block images/fonts/etc on www.ebay.com.
+                const site = siteFor(request.url);
+                // NOTE: do NOT use page.route() to block images/fonts/etc on eBay.
                 // It changes the resource-loading fingerprint and Akamai serves
                 // /splashui/captcha challenges on /fdbk/* (review/feedback) endpoints.
                 // Tested 2026-05-07: blocking caused all review URLs to hit captcha.
                 await page.setExtraHTTPHeaders({
-                    'Accept-Language': 'en-US,en;q=0.9',
+                    // Must agree with the domain — an en-US header on ebay.es is an odd pairing that
+                    // costs us fingerprint coherence for a page eBay serves in Spanish regardless.
+                    'Accept-Language': acceptLanguageFor(site),
                     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
                     'Upgrade-Insecure-Requests': '1',
                 });
@@ -250,11 +283,13 @@ void (async () => {
                     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
                     (window as unknown as { chrome: unknown }).chrome = { runtime: {} };
                 });
-                // Warm session on first visit to avoid Akamai cold-start 403
+                // Warm session on first visit to avoid Akamai cold-start 403.
+                // Each marketplace sets its own cookies (.ebay.es cookies do not come from
+                // ebay.com), so warm the origin we are about to hit — not a hard-coded one.
                 if (request.label === 'ITEM' || request.label === 'SELLER_STORE' || request.label === 'SELLER_HUB') {
-                    const cookies = await page.context().cookies('https://www.ebay.com');
+                    const cookies = await page.context().cookies(site.origin);
                     if (cookies.length === 0) {
-                        await page.goto('https://www.ebay.com', { waitUntil: 'domcontentloaded', timeout: 15000 })
+                        await page.goto(site.origin, { waitUntil: 'domcontentloaded', timeout: 15000 })
                             .catch(() => {});
                         await page.waitForTimeout(1500 + Math.random() * 1000);
                     }
@@ -303,12 +338,14 @@ void (async () => {
         // time entirely instead of being added on at the end.
         const platformMatch = request.url.match(/\/itm\/(?:[^/]+\/)?(\d+)/);
         const platformItemId = platformMatch ? platformMatch[1] : null;
+        const requestSite = siteFor(request.url);
 
         // Plain `got` (not gotScraping) — itm.ebaydesc.com has no Akamai, no
-        // browser fingerprint needed. No proxy needed either.
+        // browser fingerprint needed. No proxy needed either. The host is shared by every
+        // marketplace; `lang` is what selects the seller's localized description.
         const descriptionPromise = platformItemId
             ? got({
-                url: `https://itm.ebaydesc.com/itmdesc/${platformItemId}`,
+                url: `https://itm.ebaydesc.com/itmdesc/${platformItemId}?lang=${requestSite.lang}`,
                 timeout: { request: 15000 },
                 headers: { referer: request.url },
                 throwHttpErrors: false,
@@ -336,6 +373,13 @@ void (async () => {
         phase('main DOM rendered (h1/price wait)');
         const $ = await parseWithCheerio();
         phase('first parseWithCheerio done');
+
+        // Re-resolve after navigation: the smaller marketplaces redirect to a bigger one, and from
+        // here on every relative URL and currency default must follow where we actually landed.
+        const site = siteFor(page.url());
+        if (site.host !== requestSite.host) {
+            log.info(`ITEM: redirected ${requestSite.host} → ${site.host}, following that marketplace`);
+        }
 
         const {url} = request;
         // platformItemId already extracted at handler start (above) for parallel description fetch
@@ -367,7 +411,7 @@ void (async () => {
             else if (usrMatch) platformSellerId = usrMatch[1];
             else {
                 try {
-                    const parsed = new URL(profileUrl, 'https://www.ebay.com');
+                    const parsed = new URL(profileUrl, site.origin);
                     const storeName = parsed.searchParams.get('store_name') || parsed.searchParams.get('_ssn');
                     if (storeName) platformSellerId = storeName;
                     else {
@@ -387,14 +431,23 @@ void (async () => {
         const prices: ParsedCurrency[] = [];
         rawPriceTexts.forEach(text => {
             text.split(/\s+to\s+/i).forEach(part => {
-                const parsed = parseCurrency(part);
+                const parsed = parseCurrency(part, site.currency);
                 if (parsed) prices.push(parsed);
             });
         });
         const priceValues = prices.map(p => p.cost);
         const priceMin = priceValues.length ? Math.min(...priceValues) : null;
         const priceMax = priceValues.length ? Math.max(...priceValues) : null;
-        const currency = prices[0]?.currency || 'USD';
+        // An unmarked amount belongs to the marketplace's currency, not to USD.
+        const currency = prices[0]?.currency || site.currency;
+
+        // When the listing is priced in a foreign currency, eBay renders the buyer-facing conversion
+        // next to it ("Aproximadamente 78,57 EUR"). That is the number a local buyer actually sees,
+        // so keep it alongside the listing price rather than choosing one over the other. Absent
+        // whenever the listing already prices in the site currency.
+        const approxText = $('.x-price-approx__price').text().trim() || null;
+        const approx = parseCurrency(approxText, site.currency);
+        const localized = approx && approx.currency !== currency ? approx : null;
 
         const breadcrumb: string[] = [];
         const categoryPathIds: string[] = [];
@@ -592,11 +645,11 @@ void (async () => {
                 .trim()
                 .replace(/\.\s*$/, '');
 
-            let shipCost = 0, shipCurrency = "USD";
-            if (costText && !/^free$/i.test(costText)) {
-                const parsed = parseCurrency(costText);
-                if (parsed) { shipCost = parsed.cost; shipCurrency = parsed.currency; }
-            }
+            // No amount in the cost cell means free shipping, whatever word the site prints for it
+            // ("Free", "Gratis", "Kostenlos") — so key off the parse, not off English text.
+            let shipCost = 0, shipCurrency = site.currency;
+            const parsedShip = parseCurrency(costText, site.currency);
+            if (parsedShip) { shipCost = parsedShip.cost; shipCurrency = parsedShip.currency; }
 
             const minDays = deliveryBolds.length >= 1 ? getEstimatedDaysLeft($after(deliveryBolds[0]).text().trim()) : null;
             const maxDays = deliveryBolds.length >= 2 ? getEstimatedDaysLeft($after(deliveryBolds[1]).text().trim()) : null;
@@ -631,13 +684,14 @@ void (async () => {
 
         const scrappedItem: ScrapedItem = {
             platform: "ebay",
+            // The scraper adds no params of its own, so this is the caller's URL as landed on.
             url: page.url(),
             capturedAt: new Date().toISOString(),
             captureMode: mode,
             product: {
                 id: platformItemId,
                 title, brand,
-                pricing: { currency, priceMin, priceMax },
+                pricing: { currency, priceMin, priceMax, localized },
                 stock: { availableQuantity, soldCount },
                 shipping: { deliveryTimeText },
                 paymentMethods,
@@ -668,7 +722,7 @@ void (async () => {
         if (scrappedItem.seller) {
             if (profileUrl) {
                 try {
-                    scrappedItem.seller.profileUrl = new URL(profileUrl, 'https://www.ebay.com').toString();
+                    scrappedItem.seller.profileUrl = new URL(profileUrl, site.origin).toString();
                 } catch (_) {
                     scrappedItem.seller.profileUrl = profileUrl;
                 }
@@ -876,7 +930,9 @@ void (async () => {
         }
         let isHub = false;
         try {
-            const parsed = new URL(sellerUrl, 'https://www.ebay.com');
+            // `scrappedItem.url` is the page we actually landed on, so a relative seller href stays
+            // on the marketplace the item came from.
+            const parsed = new URL(sellerUrl, siteFor(scrappedItem.url).origin);
             // Hub patterns: /sch/i.html?_ssn=X  OR  /sch/{slug}/m.html
             isHub = /\/sch\/i\.html/i.test(parsed.pathname)
                 || /\/sch\/[^/]+\/m\.html/i.test(parsed.pathname);
@@ -933,13 +989,16 @@ void (async () => {
             // Fallback #2: construct from the slug in the URL path (/sch/{slug}/m.html)
             if (!sellerUrl || /\/sch\/i\.html/i.test(sellerUrl) || /\/sch\/[^/]+\/m\.html/i.test(sellerUrl)) {
                 try {
-                    const parsed = new URL(request.url, 'https://www.ebay.com');
+                    const hubSite = siteFor(page.url());
+                    const parsed = new URL(request.url, hubSite.origin);
                     const pathMatch = parsed.pathname.match(/\/sch\/([^/]+)\/m\.html/i);
                     const slug = (pathMatch && pathMatch[1] !== 'i.html') ? pathMatch[1] : null;
                     const ssn = parsed.searchParams.get('_ssn') || parsed.searchParams.get('store_name');
                     const finalSlug = slug || ssn;
                     if (finalSlug) {
-                        sellerUrl = `https://www.ebay.com/usr/${finalSlug}`;
+                        // Same marketplace as the hub — sending an ebay.es seller to ebay.com here
+                        // would silently switch the whole seller flow to a different site.
+                        sellerUrl = `${hubSite.origin}/usr/${finalSlug}`;
                         log.info(`SELLER_HUB: DOM resolution failed, falling back to slug → ${sellerUrl}`);
                     }
                 } catch (_) {}
@@ -980,6 +1039,7 @@ void (async () => {
         const scrappedItem = userData.scrappedItem!;
         const seller = scrappedItem.seller!;
         const sellerBaseUrl = userData.sellerBaseUrl!;
+        const site = siteFor(page.url());
         try {
             await page.waitForSelector('article.str-item-card', { timeout: 15000 }).catch(() => {
                 log.warning(`SELLER_STORE: No store items found on Shop tab`, { url: request.url });
@@ -1002,13 +1062,12 @@ void (async () => {
                 let priceMin: number | null = null, priceMax: number | null = null, currency: string | null = null;
                 if (item.priceText) {
                     const parts = item.priceText.split(/\s+to\s+/i);
-                    const fromParsed = parseCurrency(parts[0]?.trim());
+                    const fromParsed = parseCurrency(parts[0]?.trim(), site.currency);
                     if (fromParsed) { priceMin = fromParsed.cost; currency = fromParsed.currency; }
                     if (parts.length > 1) {
-                        const toParsed = parseCurrency(parts[1]?.trim());
+                        const toParsed = parseCurrency(parts[1]?.trim(), site.currency);
                         if (toParsed) priceMax = toParsed.cost;
                     }
-                    if (!currency) currency = item.priceText.match(/[A-Z]{3}/)?.[0] || null;
                 }
                 return { name: item.name, imageUrl: item.imageUrl, currency, priceMin, priceMax, url: item.url };
             });

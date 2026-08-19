@@ -16,7 +16,9 @@ import { Actor } from "apify";
 import { CheerioCrawler, Dataset } from "crawlee";
 
 import type { ActorInput, CaptureMode, ParsedCurrency, Specification } from "./dto/index.js";
+import { siteFor } from "./ebay-sites.js";
 import { auditExtraction, emptyExtractionReport, type FieldCheck, logExtractionReport } from "./extraction-audit.js";
+import { parseCurrency } from "./parse-currency.js";
 
 const VALID_MODES = ["product_only", "seller_only", "product_and_seller"];
 
@@ -42,23 +44,6 @@ const CHEERIO_SELLER_CHECKS: FieldCheck[] = [
     { path: "seller.itemsSold", severity: "warning" },
     { path: "seller.storeItems", severity: "warning", selector: ".str-item-card" },
 ];
-
-function parseCurrency(input: string | null | undefined): ParsedCurrency | null {
-    if (!input) return null;
-    const currencyMap: Record<string, string> = { "$": "USD", "€": "EUR", "£": "GBP", "¥": "JPY", "₹": "INR" };
-    const symbolMatch = input.match(/([$€£¥₹])\s*([\d,]+(?:\.\d+)?)/);
-    if (symbolMatch) {
-        return {
-            currency: currencyMap[symbolMatch[1]] || symbolMatch[1],
-            cost: parseFloat(symbolMatch[2].replace(/,/g, "")),
-        };
-    }
-    const isoMatch = input.match(/([A-Z]{3})\s*([\d,]+(?:\.\d+)?)/);
-    if (isoMatch) return { currency: isoMatch[1], cost: parseFloat(isoMatch[2].replace(/,/g, "")) };
-    const isoSuffixMatch = input.match(/([\d,]+(?:\.\d+)?)\s*([A-Z]{3})/);
-    if (isoSuffixMatch) return { currency: isoSuffixMatch[2], cost: parseFloat(isoSuffixMatch[1].replace(/,/g, "")) };
-    return null;
-}
 
 void (async () => {
     await Actor.init();
@@ -102,11 +87,14 @@ void (async () => {
         });
     }
 
+    // Benchmark script — one marketplace per run, so the proxy country is taken from the first
+    // start URL rather than dispatched per request the way main.ts does it.
+    const benchCountry = siteFor(startUrls[0]?.url ?? "").countryCode;
     const proxyConfiguration = await Actor.createProxyConfiguration({
         groups: ["RESIDENTIAL"],
-        countryCode: "US",
+        countryCode: benchCountry,
     });
-    console.log("[cheerio] Using Apify RESIDENTIAL proxy");
+    console.log(`[cheerio] Using Apify RESIDENTIAL proxy (${benchCountry})`);
 
     // ─── perf instrumentation ───
     const benchStart = Date.now();
@@ -136,15 +124,18 @@ void (async () => {
                 // before /itm/* requests succeed. Warm the session by hitting
                 // ebay.com once. sendRequest reuses the session's cookie jar
                 // and proxy, so the subsequent navigation inherits cookies.
-                const cookieStr = session.getCookieString?.("https://www.ebay.com") || "";
+                // Cookies are per-marketplace — .ebay.es never gets them from ebay.com — so warm
+                // the origin this request is headed for.
+                const { origin } = siteFor(request.url);
+                const cookieStr = session.getCookieString?.(origin) || "";
                 if (!cookieStr) {
                     try {
                         const res = await sendRequest({
-                            url: "https://www.ebay.com/",
+                            url: `${origin}/`,
                             method: "GET",
                             responseType: "text",
                         });
-                        log.info(`[cheerio] warmup status=${res.statusCode} cookies=${(session.getCookieString?.("https://www.ebay.com") || "").length}b`);
+                        log.info(`[cheerio] warmup ${origin} status=${res.statusCode} cookies=${(session.getCookieString?.(origin) || "").length}b`);
                     } catch (e) {
                         log.warning(`[cheerio] warm-up failed: ${(e as Error).message}`);
                     }
@@ -167,6 +158,7 @@ void (async () => {
 
         const platformMatch = request.url.match(/\/itm\/(?:[^/]+\/)?(\d+)/);
         const platformItemId = platformMatch ? platformMatch[1] : null;
+        const site = siteFor(request.url);
 
         const title = $("h1.x-item-title__mainTitle").text().trim() || null;
         let brand = $("dl.ux-labels-values--brand dd").text().trim() || null;
@@ -179,14 +171,14 @@ void (async () => {
         const prices: ParsedCurrency[] = [];
         rawPriceTexts.forEach((text) => {
             text.split(/\s+to\s+/i).forEach((part) => {
-                const parsed = parseCurrency(part);
+                const parsed = parseCurrency(part, site.currency);
                 if (parsed) prices.push(parsed);
             });
         });
         const priceValues = prices.map((p) => p.cost);
         const priceMin = priceValues.length ? Math.min(...priceValues) : null;
         const priceMax = priceValues.length ? Math.max(...priceValues) : null;
-        const currency = prices[0]?.currency || null;
+        const currency = prices[0]?.currency || site.currency;
 
         const breadcrumb: string[] = [];
         $("a.seo-breadcrumb-text").each((_i, el) => { breadcrumb.push($(el).find("span").text().trim()); });
@@ -302,7 +294,7 @@ void (async () => {
         // For product_and_seller: chain to seller page if we have a URL
         if (mode === "product_and_seller" && sellerProfileUrl) {
             try {
-                const absUrl = new URL(sellerProfileUrl, "https://www.ebay.com").toString().replace(/\/+$/, "");
+                const absUrl = new URL(sellerProfileUrl, site.origin).toString().replace(/\/+$/, "");
                 const isHub =
                     /\/sch\/i\.html/i.test(absUrl) || /\/sch\/[^/]+\/m\.html/i.test(absUrl);
                 await crawler.addRequests([
@@ -327,12 +319,13 @@ void (async () => {
 
         if (!resolved) {
             try {
-                const parsed = new URL(request.url, "https://www.ebay.com");
+                const hubSite = siteFor(request.url);
+                const parsed = new URL(request.url, hubSite.origin);
                 const slug =
                     parsed.pathname.match(/\/sch\/([^/]+)\/m\.html/i)?.[1] ||
                     parsed.searchParams.get("_ssn") ||
                     parsed.searchParams.get("store_name");
-                if (slug && slug !== "i.html") resolved = `https://www.ebay.com/usr/${slug}`;
+                if (slug && slug !== "i.html") resolved = `${hubSite.origin}/usr/${slug}`;
             } catch (_) {}
         }
 
@@ -400,14 +393,15 @@ void (async () => {
                 let priceMax = null;
                 let currency = null;
                 if (priceText) {
+                    const storeCurrency = siteFor(request.url).currency;
                     const parts = priceText.split(/\s+to\s+/i);
-                    const fromParsed = parseCurrency(parts[0]?.trim());
+                    const fromParsed = parseCurrency(parts[0]?.trim(), storeCurrency);
                     if (fromParsed) {
                         priceMin = fromParsed.cost;
                         currency = fromParsed.currency;
                     }
                     if (parts.length > 1) {
-                        const toParsed = parseCurrency(parts[1]?.trim());
+                        const toParsed = parseCurrency(parts[1]?.trim(), storeCurrency);
                         if (toParsed) priceMax = toParsed.cost;
                     }
                 }

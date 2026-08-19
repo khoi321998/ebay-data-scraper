@@ -1,9 +1,16 @@
-import type { ProductImage, ReviewSample, Specification } from './common.dto.js';
+import type { ParsedCurrency, ProductImage, ReviewSample, Specification } from './common.dto.js';
 
 export interface Pricing {
+    /** ISO 4217 the listing itself is priced in — falls back to the marketplace currency. */
     currency: string;
     priceMin: number | null;
     priceMax: number | null;
+    /**
+     * eBay's conversion into the marketplace currency, shown when the listing is priced in a
+     * foreign one ("Aproximadamente 78,57 EUR" on ebay.es for a USD listing). Null when the
+     * listing already prices in the site's own currency.
+     */
+    localized: ParsedCurrency | null;
 }
 
 export interface Stock {
