@@ -56,6 +56,51 @@ export function parseAmount(raw: string): number | null {
 }
 
 /**
+ * Multipliers for the compact counts eBay prints on the store card, most specific first so `mil`
+ * (Spanish thousand) is never eaten by `m` (million) and `mila` (Italian thousand) is never eaten
+ * by `mil`. Verified against ebay.es, which renders `56 mil artículos vendidos`.
+ */
+const COUNT_MULTIPLIERS: [RegExp, number][] = [
+    [/^(mrd|md)/, 1e9],
+    [/^(mio|mln|mill)/, 1e6],
+    [/^(mila|mil|tsd)/, 1e3],
+    [/^b/, 1e9],
+    [/^m/, 1e6],
+    [/^k/, 1e3],
+];
+
+/**
+ * Parse an abbreviated count — `56K`, `56 mil`, `4,3 mil`, `1.2 Mio.`, or a plain `2 329`.
+ *
+ * The number goes through `parseAmount`, so `4,3` is 4.3 on ebay.es and `4.3` is 4.3 on ebay.com;
+ * only the suffix decides the magnitude. An unrecognised suffix yields the bare number rather than
+ * a guessed factor — and is handed back in `unknownSuffix` so the caller can log it instead of
+ * silently publishing a count that is 1000× off.
+ */
+export function parseCount(text: string | null | undefined): { value: number | null; unknownSuffix: string | null } {
+    if (!text) return { value: null, unknownSuffix: null };
+    const match = text.match(NUMBER_RUN);
+    if (!match) return { value: null, unknownSuffix: null };
+
+    const amount = parseAmount(match[0]);
+    if (amount === null) return { value: null, unknownSuffix: null };
+
+    // Everything after the digits, accents dropped so `Mio.`/`mio` and stray punctuation agree.
+    const suffix = text
+        .slice((match.index ?? 0) + match[0].length)
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/[\s\u00A0\u202F.]/g, '')
+        .toLowerCase();
+
+    if (!suffix) return { value: Math.round(amount), unknownSuffix: null };
+    for (const [pattern, multiplier] of COUNT_MULTIPLIERS) {
+        if (pattern.test(suffix)) return { value: Math.round(amount * multiplier), unknownSuffix: null };
+    }
+    return { value: Math.round(amount), unknownSuffix: suffix };
+}
+
+/**
  * ISO code for the currency `input` is written in, or null when it carries no currency marker.
  * Symbols win over ISO codes so `US $90.98` reads as USD rather than tripping over stray uppercase.
  */

@@ -46,6 +46,11 @@ export interface StoreItem {
 
 /** Full seller section populated in seller modes. */
 export interface SellerSection {
+    /**
+     * Whether the store/profile is still live. `false` when eBay answered 404/410 or served a page
+     * carrying none of the store markup; `null` while we have not visited the store page yet.
+     */
+    isActive: boolean | null;
     profileUrl: string | null;
     displayName: string | null;
     ebayUsername: string | null;

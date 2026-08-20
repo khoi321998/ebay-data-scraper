@@ -2,13 +2,14 @@ import type { ExtractionReport } from './extraction.dto.js';
 import type { CaptureMode } from './input.dto.js';
 import type { Product } from './product.dto.js';
 import type { SellerRef, SellerSection } from './seller.dto.js';
+import type { ScrapeOutcome } from './status.dto.js';
 import type { SellerTechnical, Technical } from './technical.dto.js';
 
 /**
  * The unified response shape pushed to the dataset. Shape is stable across all
  * capture modes — fields not applicable to a given mode are `null`.
  */
-export interface ScrapedItem {
+export interface ScrapedItem extends ScrapeOutcome {
     platform: 'ebay';
     url: string;
     capturedAt: string;

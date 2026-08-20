@@ -10,6 +10,10 @@
                     "url",
                     "capturedAt",
                     "captureMode",
+                    "success",
+                    "errorCode",
+                    "product.isActive",
+                    "seller.isActive",
                     "product.title",
                     "product.brand",
                     "product.pricing.priceMin",
@@ -43,6 +47,22 @@
                     "captureMode": {
                         "label": "Mode",
                         "format": "text"
+                    },
+                    "success": {
+                        "label": "Success",
+                        "format": "boolean"
+                    },
+                    "errorCode": {
+                        "label": "Error",
+                        "format": "text"
+                    },
+                    "product.isActive": {
+                        "label": "Listing live",
+                        "format": "boolean"
+                    },
+                    "seller.isActive": {
+                        "label": "Store live",
+                        "format": "boolean"
                     },
                     "product.title": {
                         "label": "Product Title",
@@ -95,6 +115,54 @@
                     "extraction.status": {
                         "label": "Extraction",
                         "format": "text"
+                    }
+                }
+            }
+        },
+        "failures": {
+            "title": "Failures",
+            "description": "Rows where the capture did not produce a live, fully parsed page — a removed listing/store, a block, or a markup change. `success: true` rows are the ones safe to consume.",
+            "transformation": {
+                "fields": [
+                    "url",
+                    "captureMode",
+                    "success",
+                    "errorCode",
+                    "errorMessage",
+                    "product.isActive",
+                    "seller.isActive"
+                ]
+            },
+            "display": {
+                "component": "table",
+                "properties": {
+                    "url": {
+                        "label": "URL",
+                        "format": "link"
+                    },
+                    "captureMode": {
+                        "label": "Mode",
+                        "format": "text"
+                    },
+                    "success": {
+                        "label": "Success",
+                        "format": "boolean"
+                    },
+                    "errorCode": {
+                        "label": "Error code",
+                        "format": "text"
+                    },
+                    "errorMessage": {
+                        "label": "Detail",
+                        "format": "text"
+                    },
+                    "product.isActive": {
+                        "label": "Listing live",
+                        "format": "boolean"
+                    },
+                    "seller.isActive": {
+                        "label": "Store live",
+                        "format": "boolean"
                     }
                 }
             }

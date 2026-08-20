@@ -29,12 +29,13 @@ import type { Page, Request as PlaywrightRequest } from "playwright";
 import type {
     ActorInput,
     CaptureMode,
+    DetailedRatings,
+    FeedbackSummary,
     ParsedCurrency,
     ProductImage,
     RequestUserData,
     ReviewSample,
     ScrapedItem,
-    SellerSection,
     ShippingOption,
     Specification,
 } from "./dto/index.js";
@@ -43,6 +44,7 @@ import {
     DEFAULT_SITE,
     isEbayUrl,
     siteFor,
+    storeBaseUrl,
 } from "./ebay-sites.js";
 import {
     auditExtraction,
@@ -50,17 +52,45 @@ import {
     logExtractionReport,
     SCRAPED_ITEM_CHECKS,
 } from "./extraction-audit.js";
-import { parseCurrency } from "./parse-currency.js";
+import { parseAmount, parseCount, parseCurrency } from "./parse-currency.js";
+import {
+    blankScrapedItem,
+    blockedError,
+    detectProductGone,
+    emptySellerSection,
+    isGoneStatus,
+    isSellerAlive,
+    isWalled,
+    markFailure,
+    STATUS_SELECTORS,
+} from "./scrape-status.js";
 
 const en = JSON.parse(fsSync.readFileSync('./node_modules/i18n-iso-countries/langs/en.json', 'utf8'));
 
 /**
  * Single exit point for the dataset: audits the record against SCRAPED_ITEM_CHECKS so a silent
  * selector break shows up as `extraction.missingFields` instead of an unexplained `null`.
+ *
+ * Records that already carry a failure skip the audit — a listing we know is gone has nothing to
+ * audit, and a report claiming twenty broken selectors would bury the one fact that matters. Their
+ * `extraction.checkedFields` stays at 0, which is how "not audited" reads in the dataset.
  */
 async function pushScrapedItem(scrappedItem: ScrapedItem, log: Log): Promise<void> {
-    scrappedItem.extraction = auditExtraction(scrappedItem, SCRAPED_ITEM_CHECKS);
-    logExtractionReport(scrappedItem.extraction, log, scrappedItem.url);
+    if (scrappedItem.success) {
+        scrappedItem.extraction = auditExtraction(scrappedItem, SCRAPED_ITEM_CHECKS);
+        logExtractionReport(scrappedItem.extraction, log, scrappedItem.url);
+        // A page that parsed but produced none of its critical fields is a failed capture, not a
+        // healthy record with a footnote — the caller should not treat those numbers as real.
+        if (scrappedItem.extraction.status === 'broken') {
+            markFailure(
+                scrappedItem,
+                'EXTRACTION_BROKEN',
+                `Critical fields absent, likely an eBay markup change: ${scrappedItem.extraction.missingFields.join(', ')}`,
+            );
+        }
+    } else {
+        log.warning(`push ${scrappedItem.errorCode} — ${scrappedItem.errorMessage}`, { url: scrappedItem.url });
+    }
     await Dataset.pushData(scrappedItem);
 }
 countries.registerLocale(en);
@@ -77,6 +107,85 @@ function getEstimatedDaysLeft(dateText: string): number {
     return Math.round(diffMs / (1000 * 60 * 60 * 24));
 }
 
+/** The four detailed seller ratings, in the order eBay renders them on every marketplace. */
+const DSR_ORDER = ['accurateDescription', 'shippingCost', 'shippingSpeed', 'communication'] as const;
+
+/** Store-card stats other than the percentage, in the order eBay renders them. */
+const STORE_STAT_ORDER = ['itemsSold', 'followers'] as const;
+
+/** English DSR label → key. Only matches on ebay.com; elsewhere the caller falls back to position. */
+function DSR_KEY_BY_LABEL(label: string | null): (typeof DSR_ORDER)[number] | null {
+    const text = label?.toLowerCase() ?? '';
+    if (text.includes('accurate')) return 'accurateDescription';
+    if (text.includes('shipping cost')) return 'shippingCost';
+    if (text.includes('shipping speed')) return 'shippingSpeed';
+    if (text.includes('communication')) return 'communication';
+    return null;
+}
+
+/**
+ * Which feedback bucket a `.rating-element` belongs to.
+ *
+ * The label beside it is translated ("Positivos" on ebay.es), so the href is the real key: eBay
+ * puts `commentType=POSITIVE` and `overall_rating:POSITIVE` in it verbatim on every marketplace.
+ * The label is only a fallback, matched on the stem shared by the Romance and Germanic spellings
+ * (positive/positivos/positif/positiv/positivi) with accents stripped.
+ */
+function feedbackTypeOf(href: string | null, label: string | null): 'positive' | 'neutral' | 'negative' | null {
+    const fromHref = href?.match(/(POSITIVE|NEUTRAL|NEGATIVE)/i)?.[1];
+    if (fromHref) return fromHref.toLowerCase() as 'positive' | 'neutral' | 'negative';
+
+    const stem = (label ?? '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+    if (stem.startsWith('positi')) return 'positive';
+    if (stem.startsWith('negati')) return 'negative';
+    if (stem.startsWith('neutr')) return 'neutral';
+    return null;
+}
+
+/**
+ * Open one of the store tabs (`shop` / `feedback` / `about`) and wait for its content.
+ *
+ * These tabs used to be found by their English label — `textContent === 'feedback'` — which quietly
+ * did nothing on every non-English marketplace: ebay.es renders "Valoraciones", so the click never
+ * fired, `.rating-element` never appeared, and the seller's whole feedback section came back empty
+ * with a single warning line to show for it.
+ *
+ * eBay keys each tab with a `_tab` query param (`/str/{slug}?_tab=feedback`), identical on every
+ * marketplace, so we load that URL rather than hunting for a control to click.
+ *
+ * Clicking is not an option worth keeping: the tab controls are `div[role="tab"]` carrying only the
+ * translated label and no href, so the only clickable thing pointing at a tab is an incidental
+ * anchor elsewhere on the page (the store card's "97.7% positive feedback" link points at the
+ * feedback tab; nothing points at the about tab). And that anchor is a real `<a href>`, so clicking
+ * it costs the same full page load a `goto` does. One code path, same request count, and no
+ * dependence on an anchor eBay never promised to keep.
+ *
+ * Returns whether the tab's content actually materialised.
+ */
+async function openStoreTab(
+    page: Page,
+    tab: 'shop' | 'feedback' | 'about',
+    readySelector: string,
+    log: Log,
+): Promise<boolean> {
+    const isReady = async () => (await page.$(readySelector)) !== null;
+    // Already looking at it — the shop tab often renders the store card the other tabs need.
+    if (await isReady()) return true;
+
+    // `page.url()` is the base so we keep whatever marketplace and redirect we landed on, and
+    // overwrite any `_tab` already set by a previous call.
+    try {
+        const target = new URL(page.url());
+        target.searchParams.set('_tab', tab);
+        log.info(`SELLER_STORE: loading ${tab} tab → ${target.toString()}`);
+        await page.goto(target.toString(), { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await page.waitForSelector(readySelector, { timeout: 30000 }).catch(() => {});
+    } catch (err) {
+        log.warning(`SELLER_STORE: ${tab} tab navigation failed`, { error: (err as Error).message });
+    }
+    return isReady();
+}
+
 function makePhaseLogger(log: Log, label: string): (name: string) => void {
     const t0 = Date.now();
     let last = t0;
@@ -86,30 +195,6 @@ function makePhaseLogger(log: Log, label: string): (name: string) => void {
         const total = ((now - t0) / 1000).toFixed(2);
         log.info(`[${label}] ${name} | step=${step}s | total=${total}s`);
         last = now;
-    };
-}
-
-function emptySellerSection(): SellerSection {
-    return {
-        profileUrl: null,
-        displayName: null,
-        ebayUsername: null,
-        storeId: null,
-        feedbackScore: null,
-        positivePercent: null,
-        itemsSold: null,
-        followers: null,
-        feedback: {
-            summary: { positive: null, neutral: null, negative: null },
-            detailedRatings: { accurateDescription: null, shippingSpeed: null, communication: null, shippingCost: null },
-            negativeReviewSamples: [],
-            positiveReviewSamples: [],
-            neutralReviewSamples: []
-        },
-        totalSellerFeedbackCount: null,
-        about: null,
-        logoUrl: null,
-        storeItems: []
     };
 }
 
@@ -159,23 +244,14 @@ void (async () => {
     let startUrls;
     if (mode === 'seller_only') {
         startUrls = inputUrls.map(url => {
-            const trimmed = url.replace(/\/+$/, '');
+            // Strips `_tab`/tracking off a /str/ or /usr/ URL; leaves a hub URL's query intact.
+            const trimmed = storeBaseUrl(url);
             const isHub = /\/sch\/i\.html/i.test(trimmed) || /\/sch\/[^/]+\/m\.html/i.test(trimmed);
-            const seed = {
-                platform: "ebay",
-                url: trimmed,
-                capturedAt: new Date().toISOString(),
-                captureMode: mode,
-                product: null,
-                sellerRef: null,
-                seller: emptySellerSection(),
-                technical: null,
-                sellerTechnical: null,
-                extraction: emptyExtractionReport()
-            };
-            seed.seller.profileUrl = trimmed;
+            const seed = blankScrapedItem(trimmed, mode);
+            const seedSeller = seed.seller!;
+            seedSeller.profileUrl = trimmed;
             const slugMatch = trimmed.match(/\/(?:str|usr)\/([^/?]+)/i);
-            if (slugMatch) seed.seller.ebayUsername = slugMatch[1];
+            if (slugMatch) seedSeller.ebayUsername = slugMatch[1];
             return {
                 url: trimmed,
                 label: isHub ? 'SELLER_HUB' : 'SELLER_STORE',
@@ -300,6 +376,12 @@ void (async () => {
             async ({ page, request, response, log }) => {
                 const status = response?.status();
                 if (!status || status < 400) return;
+                // 404/410 is eBay's normal answer for a removed listing/store, not an anti-bot
+                // problem — the handlers turn it into a NOT_FOUND record, so no forensics needed.
+                if (isGoneStatus(status)) {
+                    log.info(`POST-NAV ${status} on ${request.url} — page removed from eBay`, { label: request.label });
+                    return;
+                }
                 const headers = response!.headers();
                 log.error(`POST-NAV ${status} on ${request.url}`, {
                     label: request.label,
@@ -318,17 +400,32 @@ void (async () => {
                 log.error(`Screenshot saved → ${screenshotPath}`);
             },
         ],
+        // A request that exhausts its retries used to vanish from the dataset entirely, so a caller
+        // could not tell "eBay blocked us" from "we never got asked to scrape it". Push whatever the
+        // chain had assembled so far (or an empty record of the right shape) carrying the reason.
         failedRequestHandler: async ({ request, log }, error) => {
+            const message = error?.message || 'Unknown error';
             log.error(`Request failed: ${request.url}`, {
                 label: request.label,
                 retryCount: request.retryCount,
-                error: error?.message || 'Unknown error',
+                error: message,
             });
+            const carried = (request.userData as RequestUserData).scrappedItem;
+            const scrappedItem = carried ?? blankScrapedItem(request.url, mode);
+            // `blockedError` and the navigation timeouts that follow a bot wall are the same story:
+            // eBay would not serve us the page. Anything else is a plain navigation failure.
+            const blocked = /blocked|captcha|403|429|Timeout/i.test(message);
+            markFailure(
+                scrappedItem,
+                blocked ? 'BLOCKED' : 'NAVIGATION_FAILED',
+                `${request.label ?? 'REQUEST'} gave up after ${request.retryCount} retries on ${request.url}: ${message}`,
+            );
+            await pushScrapedItem(scrappedItem, log);
         },
     });
 
     // ──────────────────── ITEM ────────────────────
-    crawler.router.addHandler("ITEM", async ({ page, request, parseWithCheerio, log }) => {
+    crawler.router.addHandler("ITEM", async ({ page, request, response, parseWithCheerio, log }) => {
         const phase = makePhaseLogger(log, 'ITEM');
         phase('handler start');
 
@@ -339,6 +436,17 @@ void (async () => {
         const platformMatch = request.url.match(/\/itm\/(?:[^/]+\/)?(\d+)/);
         const platformItemId = platformMatch ? platformMatch[1] : null;
         const requestSite = siteFor(request.url);
+
+        // Listing removed from the platform: definitive, so record it and skip the rest of the
+        // handler rather than spending 20s waiting for a title that will never render.
+        const httpStatus = response?.status();
+        if (isGoneStatus(httpStatus)) {
+            const gone = blankScrapedItem(request.url, mode, platformItemId);
+            gone.product!.isActive = false;
+            markFailure(gone, 'PRODUCT_NOT_FOUND', `eBay returned HTTP ${httpStatus} for this listing`);
+            await pushScrapedItem(gone, log);
+            return;
+        }
 
         // Plain `got` (not gotScraping) — itm.ebaydesc.com has no Akamai, no
         // browser fingerprint needed. No proxy needed either. The host is shared by every
@@ -373,6 +481,24 @@ void (async () => {
         phase('main DOM rendered (h1/price wait)');
         const $ = await parseWithCheerio();
         phase('first parseWithCheerio done');
+
+        // eBay's soft-404 / ended-listing layouts arrive with HTTP 200, so they can only be told
+        // apart here, from the DOM.
+        const goneReason = detectProductGone($);
+        if (goneReason) {
+            const gone = blankScrapedItem(page.url(), mode, platformItemId);
+            gone.product!.isActive = false;
+            markFailure(gone, 'PRODUCT_NOT_FOUND', goneReason);
+            await pushScrapedItem(gone, log);
+            return;
+        }
+
+        // Neither title nor price and no eBay chrome: this is the bot wall, not a listing. Throwing
+        // hands it back to Crawlee for a retry on a fresh session — recording it as a null-filled
+        // "successful" row is what used to make blocks look like markup changes.
+        if ($(STATUS_SELECTORS.productTitle).length === 0 && $(STATUS_SELECTORS.productPrice).length === 0) {
+            throw blockedError(httpStatus, !isWalled($));
+        }
 
         // Re-resolve after navigation: the smaller marketplaces redirect to a bigger one, and from
         // here on every relative URL and currency default must follow where we actually landed.
@@ -688,8 +814,14 @@ void (async () => {
             url: page.url(),
             capturedAt: new Date().toISOString(),
             captureMode: mode,
+            // The gone/walled checks above already returned or threw, so reaching here means a live
+            // listing. pushScrapedItem() flips these if the audit finds the parse produced nothing.
+            success: true,
+            errorCode: null,
+            errorMessage: null,
             product: {
                 id: platformItemId,
+                isActive: true,
                 title, brand,
                 pricing: { currency, priceMin, priceMax, localized },
                 stock: { availableQuantity, soldCount },
@@ -925,6 +1057,9 @@ void (async () => {
         const sellerUrl = scrappedItem.seller?.profileUrl;
         if (!sellerUrl) {
             log.warning('No seller profileUrl found on product page, pushing product-only data');
+            // The caller asked for seller data and is not getting any — say so on the record rather
+            // than shipping a half-empty seller section that reads like a dead store.
+            markFailure(scrappedItem, 'SELLER_UNRESOLVED', 'Product page exposed no seller profile link');
             await pushScrapedItem(scrappedItem, log);
             return;
         }
@@ -946,7 +1081,7 @@ void (async () => {
                 userData: { scrappedItem }
             }]);
         } else {
-            const baseUrl = sellerUrl.replace(/\/+$/, '');
+            const baseUrl = storeBaseUrl(sellerUrl);
             scrappedItem.seller!.profileUrl = baseUrl;
             await crawler.addRequests([{
                 url: baseUrl,
@@ -962,11 +1097,21 @@ void (async () => {
     //   /sch/{slug}/m.html?...          (seller's items listing)
     // Extract real seller URL from .str-seller-card if present, else from links
     // that point to /str/{slug} or /usr/{slug}, else construct from the path slug.
-    crawler.router.addHandler("SELLER_HUB", async ({ page, request, log }) => {
+    crawler.router.addHandler("SELLER_HUB", async ({ page, request, response, log }) => {
         const phase = makePhaseLogger(log, 'SELLER_HUB');
         phase('handler start');
 
         const scrappedItem = (request.userData as RequestUserData).scrappedItem!;
+
+        // A hub URL for a seller eBay has removed 404s just like the store page does.
+        const httpStatus = response?.status();
+        if (isGoneStatus(httpStatus)) {
+            scrappedItem.seller!.isActive = false;
+            markFailure(scrappedItem, 'SELLER_NOT_FOUND', `eBay returned HTTP ${httpStatus} for seller hub ${request.url}`);
+            await pushScrapedItem(scrappedItem, log);
+            return;
+        }
+
         try {
             await page.waitForSelector('.str-seller-card, a[href*="/str/"], a[href*="/usr/"]', { timeout: 20000 }).catch(() => {
                 log.warning(`SELLER_HUB: no seller-card or store/user link found`, { url: request.url });
@@ -1006,11 +1151,12 @@ void (async () => {
 
             if (!sellerUrl) {
                 log.warning(`SELLER_HUB: could not resolve real seller URL, pushing product-only data`, { url: request.url });
+                markFailure(scrappedItem, 'SELLER_UNRESOLVED', `Seller hub ${request.url} exposed no store/profile link`);
                 await pushScrapedItem(scrappedItem, log);
                 return;
             }
 
-            const cleaned = sellerUrl.split('?')[0].replace(/\/+$/, '');
+            const cleaned = storeBaseUrl(sellerUrl);
             log.info(`SELLER_HUB: resolved → ${cleaned}`);
             scrappedItem.seller!.profileUrl = cleaned;
             const slugMatch = cleaned.match(/\/(?:str|usr)\/([^/?]+)/i);
@@ -1031,7 +1177,7 @@ void (async () => {
     });
 
     // ──────────────────── SELLER_STORE ────────────────────
-    crawler.router.addHandler("SELLER_STORE", async ({ page, request, log }) => {
+    crawler.router.addHandler("SELLER_STORE", async ({ page, request, response, parseWithCheerio, log }) => {
         const phase = makePhaseLogger(log, 'SELLER_STORE');
         phase('handler start');
 
@@ -1040,11 +1186,36 @@ void (async () => {
         const seller = scrappedItem.seller!;
         const sellerBaseUrl = userData.sellerBaseUrl!;
         const site = siteFor(page.url());
+
+        // Store removed from the platform — definitive, and worth catching before the 15s wait for
+        // items that will never load.
+        const httpStatus = response?.status();
+        if (isGoneStatus(httpStatus)) {
+            seller.isActive = false;
+            markFailure(scrappedItem, 'SELLER_NOT_FOUND', `eBay returned HTTP ${httpStatus} for ${request.url}`);
+            await pushScrapedItem(scrappedItem, log);
+            return;
+        }
+
         try {
             await page.waitForSelector('article.str-item-card', { timeout: 15000 }).catch(() => {
                 log.warning(`SELLER_STORE: No store items found on Shop tab`, { url: request.url });
             });
             phase('store items DOM ready');
+
+            // Same three-way split as the item page: no eBay chrome means we were walled and should
+            // retry; chrome but none of the store markup means the store itself is gone.
+            const $store = await parseWithCheerio();
+            if (isWalled($store)) {
+                throw blockedError(httpStatus, false);
+            }
+            if (!isSellerAlive($store)) {
+                seller.isActive = false;
+                markFailure(scrappedItem, 'SELLER_NOT_FOUND', `${request.url} rendered none of the store/profile markup`);
+                await pushScrapedItem(scrappedItem, log);
+                return;
+            }
+            seller.isActive = true;
 
             const rawItems = await page.evaluate(() => {
                 const items: { name: string | null; imageUrl: string | null; priceText: string | null; url: string | null }[] = [];
@@ -1074,50 +1245,44 @@ void (async () => {
             log.info(`Scraped ${seller.storeItems.length} store items`);
             phase('store items extracted');
 
-            const feedbackClicked = await page.evaluate(() => {
-                const tabs = document.querySelectorAll('[role="tab"]');
-                for (const tab of tabs) {
-                    if (tab.textContent?.trim().toLowerCase() === 'feedback') { (tab as HTMLElement).click(); return true; }
-                }
-                return false;
-            });
-            if (feedbackClicked) {
-                await page.waitForSelector('.rating-element', { timeout: 30000 }).catch((err: unknown) => {
-                    log.warning(`SELLER_STORE: Feedback content not found after clicking tab`, { url: request.url, error: (err as Error).message });
-                });
-            } else {
-                log.warning(`SELLER_STORE: Feedback tab not found`, { url: request.url });
+            if (!await openStoreTab(page, 'feedback', '.rating-element', log)) {
+                log.warning(`SELLER_STORE: Feedback content never rendered`, { url: request.url });
             }
             phase('feedback tab loaded');
 
-            const { summary, detailedRatings, totalSellerFeedbackCount, displayName, ebayUsername, storeId, feedbackScore, positivePercent, itemsSold, followers, feedbackLinks, logoUrl } = await page.evaluate(() => {
-                const summary: { positive: number | null; neutral: number | null; negative: number | null } = { positive: null, neutral: null, negative: null };
-                document.querySelectorAll('.rating-element').forEach(el => {
-                    const label = el.querySelector(':scope > span')?.textContent?.trim().toLowerCase();
-                    const numText = el.querySelector('.INLINE_LINK')?.textContent?.trim().replace(/,/g, '');
-                    const num = numText ? parseInt(numText, 10) : null;
-                    if (label === 'positive') summary.positive = num;
-                    else if (label === 'neutral') summary.neutral = num;
-                    else if (label === 'negative') summary.negative = num;
+            const raw = await page.evaluate(() => {
+                // Every number and label on this page is localized — `2 329` on ebay.es, `2,329` on
+                // ebay.com, "Positivos" vs "Positive". So the browser only reads text out of the
+                // DOM; interpreting it is Node's job, where the locale-tolerant parsers live.
+                const ratingElements = [...document.querySelectorAll('.rating-element')].map(el => {
+                    const anchor = el.querySelector('a');
+                    return {
+                        // The href carries `commentType=POSITIVE`, which is identical on every
+                        // marketplace — unlike the label beside it, which is the seller's language.
+                        href: anchor?.href || null,
+                        label: el.querySelector(':scope > span')?.textContent?.trim() || null,
+                        countText: el.querySelector('.INLINE_LINK')?.textContent?.trim() || null,
+                    };
                 });
 
-                const detailedRatings: { accurateDescription: number | null; shippingSpeed: number | null; communication: number | null; shippingCost: number | null } = {
-                    accurateDescription: null, shippingSpeed: null,
-                    communication: null, shippingCost: null
-                };
-                document.querySelectorAll('.fdbk-detail-seller-rating').forEach(el => {
-                    const label = el.querySelector('.fdbk-detail-seller-rating__label span')?.textContent?.trim().toLowerCase();
-                    const value = parseFloat(el.querySelector('.fdbk-detail-seller-rating__value')?.textContent?.trim() || '');
-                    if (!Number.isNaN(value)) {
-                        if (label?.includes('accurate')) detailedRatings.accurateDescription = value;
-                        else if (label?.includes('shipping cost')) detailedRatings.shippingCost = value;
-                        else if (label?.includes('shipping speed')) detailedRatings.shippingSpeed = value;
-                        else if (label?.includes('communication')) detailedRatings.communication = value;
-                    }
-                });
+                const detailedRatingRows = [...document.querySelectorAll('.fdbk-detail-seller-rating')].map(el => ({
+                    label: el.querySelector('.fdbk-detail-seller-rating__label span')?.textContent?.trim() || null,
+                    valueText: el.querySelector('.fdbk-detail-seller-rating__value')?.textContent?.trim() || null,
+                }));
+
+                const storeStats = [...document.querySelectorAll('.str-seller-card__store-stats-content > div')].map(div => ({
+                    text: div.textContent?.trim() || '',
+                    boldText: div.querySelector('.BOLD')?.textContent?.trim() || '',
+                    // The percentage is the only stat wrapped in the feedback link — a structural
+                    // marker, so it survives translation.
+                    isFeedbackLink: !!div.querySelector('a.str-seller-card__feedback-link'),
+                }));
 
                 const feedbackCountText = document.querySelector('.fdbk-detail-list__title .SECONDARY')?.textContent || '';
-                const totalSellerFeedbackCount = parseInt(feedbackCountText.replace(/[()\s,]/g, ''), 10) || null;
+                const altPercentText = document.querySelector('.fdbk-overall-rating__bar-text')?.textContent?.trim()
+                    || document.querySelector('.fdbk-overall-rating .SECONDARY')?.textContent?.trim()
+                    || document.querySelector('[class*="positive-feedback"]')?.textContent?.trim()
+                    || '';
 
                 let ebayUsername = null;
                 const scripts = document.querySelectorAll('script');
@@ -1157,61 +1322,84 @@ void (async () => {
                     } catch (e) { /* ignore malformed data-track */ }
                 }
 
-                function parseAbbreviated(text: string): number | null {
-                    if (!text) return null;
-                    const m = text.match(/([\d,.]+)\s*([KMB]?)/i);
-                    if (!m) return null;
-                    let num = parseFloat(m[1].replace(/,/g, ''));
-                    const suffix = m[2].toUpperCase();
-                    if (suffix === 'K') num *= 1000;
-                    else if (suffix === 'M') num *= 1000000;
-                    else if (suffix === 'B') num *= 1000000000;
-                    return Math.round(num);
-                }
-
-                let itemsSold = null;
-                let followers = null;
-                document.querySelectorAll('.str-seller-card__store-stats-content > div').forEach(div => {
-                    const text = div.textContent?.trim().toLowerCase() || '';
-                    const boldText = div.querySelector('.BOLD')?.textContent?.trim() || '';
-                    if (text.includes('items sold')) itemsSold = parseAbbreviated(boldText);
-                    else if (text.includes('follower')) followers = parseAbbreviated(boldText);
-                });
-
-                const scoreText = document.querySelector('.fdbk-detail-list__title .SECONDARY')?.textContent || '';
-                const scoreMatch = scoreText.match(/([\d,]+)/);
-                const feedbackScore = scoreMatch ? parseInt(scoreMatch[1].replace(/,/g, ''), 10) : null;
-
-                let positivePercent = null;
-                const percentEl = document.querySelector('.fdbk-overall-rating__bar-text');
-                if (percentEl) {
-                    positivePercent = parseFloat(percentEl.textContent?.trim().replace('%', '') || '') || null;
-                }
-                if (!positivePercent) {
-                    const altPercent = document.querySelector('.fdbk-overall-rating .SECONDARY')?.textContent?.trim()
-                        || document.querySelector('[class*="positive-feedback"]')?.textContent?.trim()
-                        || '';
-                    const pctMatch = altPercent.match(/([\d.]+)\s*%/);
-                    if (pctMatch) positivePercent = parseFloat(pctMatch[1]);
-                }
-                if (!positivePercent && summary.positive != null) {
-                    const total = (summary.positive || 0) + (summary.neutral || 0) + (summary.negative || 0);
-                    if (total > 0) positivePercent = Math.round((summary.positive / total) * 10000) / 100;
-                }
-
-                const feedbackLinks: { negative: string | null; positive: string | null; neutral: string | null } = { negative: null, positive: null, neutral: null };
-                document.querySelectorAll('.rating-element').forEach(el => {
-                    const label = el.querySelector(':scope > span')?.textContent?.trim().toLowerCase();
-                    const href = el.querySelector('a')?.href;
-                    if (label === 'negative' && href) feedbackLinks.negative = href;
-                    else if (label === 'positive' && href) feedbackLinks.positive = href;
-                    else if (label === 'neutral' && href) feedbackLinks.neutral = href;
-                });
-
                 const logoUrl = (document.querySelector('img.str-header__logo--img') as HTMLImageElement | null)?.src || null;
 
-                return { summary, detailedRatings, totalSellerFeedbackCount, displayName, ebayUsername, storeId, feedbackScore, positivePercent, itemsSold, followers, feedbackLinks, logoUrl };
+                return { ratingElements, detailedRatingRows, storeStats, feedbackCountText, altPercentText, displayName, ebayUsername, storeId, logoUrl };
             });
+
+            // ── Interpret the raw text, marketplace by marketplace ──
+            const warnCount = (label: string, parsed: ReturnType<typeof parseCount>) => {
+                if (parsed.unknownSuffix) {
+                    log.warning(`SELLER_STORE: unrecognised count suffix on ${label} — add it to COUNT_MULTIPLIERS`, {
+                        url: request.url, suffix: parsed.unknownSuffix,
+                    });
+                }
+                return parsed.value;
+            };
+
+            const summary: FeedbackSummary = { positive: null, neutral: null, negative: null };
+            const feedbackLinks: Record<'negative' | 'positive' | 'neutral', string | null> = {
+                negative: null, positive: null, neutral: null,
+            };
+            for (const row of raw.ratingElements) {
+                const type = feedbackTypeOf(row.href, row.label);
+                if (!type) continue;
+                summary[type] = warnCount(`feedback summary (${type})`, parseCount(row.countText));
+                if (row.href) feedbackLinks[type] = row.href;
+            }
+
+            const detailedRatings: DetailedRatings = {
+                accurateDescription: null, shippingSpeed: null, communication: null, shippingCost: null,
+            };
+            raw.detailedRatingRows.forEach((row, i) => {
+                const value = parseAmount(row.valueText || '');
+                if (value === null) return;
+                // eBay renders the four DSRs in a fixed order on every marketplace, so the position
+                // is the reliable key; the English label match just protects against a reorder.
+                const key = DSR_KEY_BY_LABEL(row.label)
+                    ?? (raw.detailedRatingRows.length === DSR_ORDER.length ? DSR_ORDER[i] : null);
+                if (key) detailedRatings[key] = value;
+            });
+
+            // `(23.560)` on ebay.es is 23560, not 23 — parseAmount reads the convention off the string.
+            const feedbackScore = parseAmount(raw.feedbackCountText.replace(/[()]/g, '')) ?? null;
+            // Both fields have always been read off this one element; they were only ever computed
+            // by two different regexes over the same text, so keep them explicitly the same number.
+            const totalSellerFeedbackCount = feedbackScore;
+
+            let positivePercent: number | null = null;
+            let itemsSold: number | null = null;
+            let followers: number | null = null;
+            const otherStats: typeof raw.storeStats = [];
+            for (const stat of raw.storeStats) {
+                if (stat.isFeedbackLink) {
+                    positivePercent = parseAmount(stat.boldText.replace('%', ''));
+                    continue;
+                }
+                otherStats.push(stat);
+            }
+            otherStats.forEach((stat, i) => {
+                // en + es labels are verified; every other marketplace falls back to eBay's fixed
+                // "% positive, items sold, followers" order, which is why the pair must be complete.
+                const text = stat.text.toLowerCase();
+                let key: (typeof STORE_STAT_ORDER)[number] | null = null;
+                if (/sold|vendid/.test(text)) key = 'itemsSold';
+                else if (/follow|seguidor/.test(text)) key = 'followers';
+                else if (otherStats.length === STORE_STAT_ORDER.length) key = STORE_STAT_ORDER[i];
+
+                if (key === 'itemsSold') itemsSold = warnCount('items sold', parseCount(stat.boldText));
+                else if (key === 'followers') followers = warnCount('followers', parseCount(stat.boldText));
+            });
+
+            if (positivePercent === null && summary.positive !== null) {
+                const total = (summary.positive || 0) + (summary.neutral || 0) + (summary.negative || 0);
+                if (total > 0) positivePercent = Math.round((summary.positive / total) * 10000) / 100;
+            }
+            if (positivePercent === null && raw.altPercentText) {
+                positivePercent = parseAmount(raw.altPercentText.replace('%', ''));
+            }
+
+            const { displayName, ebayUsername, storeId, logoUrl } = raw;
 
             let resolvedUsername = ebayUsername || seller.ebayUsername;
             if (!resolvedUsername) {
@@ -1273,37 +1461,53 @@ void (async () => {
             // scrappedItem.sellerTechnical = sellerTechnical;
             phase('seller data extracted');
 
-            const aboutClicked = await page.evaluate(() => {
-                const tabs = document.querySelectorAll('[role="tab"]');
-                for (const tab of tabs) {
-                    if (tab.textContent?.trim().toLowerCase() === 'about') { (tab as HTMLElement).click(); return true; }
-                }
-                return false;
-            });
-            if (aboutClicked) {
-                await page.waitForSelector('.str-about-description__seller-info .BOLD', { timeout: 15000 }).catch(() => {});
-            }
+            // Same locale trap as the feedback tab — "about" is "Información" on ebay.es.
+            await openStoreTab(page, 'about', '.str-about-description, .str-business-details', log);
             const aboutData = await page.evaluate(() => {
-                const aboutDescription = document.querySelector('.str-about-description__description .str-text-span')?.textContent?.trim() || null;
-                const sellerInfoMap: Record<string, string> = {};
-                document.querySelectorAll('.str-about-description__seller-info > span').forEach(el => {
-                    const key = el.querySelector('.SECONDARY')?.textContent?.replace(/[: ]/g, '').trim().toLowerCase();
-                    const value = el.querySelector('.BOLD')?.textContent?.trim();
-                    if (key && value) sellerInfoMap[key] = value;
-                });
-                const businessDetails: Record<string, string> = {};
-                document.querySelectorAll('.str-business-details__seller-info > span').forEach(el => {
-                    const key = el.querySelector('.SECONDARY')?.textContent?.replace(/[: ]/g, '').trim().toLowerCase();
-                    const value = el.querySelector('.BOLD')?.textContent?.trim();
-                    if (key && value) businessDetails[key.replace(/\s+/g, '_')] = value;
-                });
-                return { aboutDescription, sellerInfoMap, businessDetails };
+                const readRows = (selector: string) => [...document.querySelectorAll(selector)].map(el => ({
+                    label: el.querySelector('.SECONDARY')?.textContent?.trim() || '',
+                    value: el.querySelector('.BOLD')?.textContent?.trim() || '',
+                }));
+                return {
+                    aboutDescription: document.querySelector('.str-about-description__description .str-text-span')?.textContent?.trim() || null,
+                    sellerInfoRows: readRows('.str-about-description__seller-info > span'),
+                    businessDetailRows: readRows('.str-business-details__seller-info > span'),
+                };
             });
+
+            // These labels are translated too — ebay.es renders "Ubicación:", "Usuario desde:",
+            // "Vendedor:". Matching them by English text left `memberSince` null on every
+            // marketplace including ebay.com, where the key was normalised to `membersince` and so
+            // never matched the `'member since'` lookup it was written for.
+            //
+            // Classify by the shape of the *value* instead: a four-digit year is a join date, the
+            // seller's own username is a row we already have off the store header, and whatever is
+            // left is the location. English labels still win when they are there.
+            let aboutLocation: string | null = null;
+            let aboutMemberSince: string | null = null;
+            for (const row of aboutData.sellerInfoRows) {
+                if (!row.value) continue;
+                const label = row.label.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+                if (label.includes('location')) { aboutLocation = row.value; continue; }
+                if (label.includes('member since')) { aboutMemberSince = row.value; continue; }
+                if (/\b(19|20)\d{2}\b/.test(row.value)) { aboutMemberSince ??= row.value; continue; }
+                if (resolvedUsername && row.value.toLowerCase() === resolvedUsername.toLowerCase()) continue;
+                aboutLocation ??= row.value;
+            }
+
+            // Business details stay a free-form passthrough map — keep eBay's own labels, trimmed of
+            // the trailing colon and non-breaking space so the keys are usable.
+            const businessDetails: Record<string, string> = {};
+            for (const row of aboutData.businessDetailRows) {
+                const key = row.label.replace(/[:\s\u00A0]+$/, '').trim().toLowerCase().replace(/\s+/g, '_');
+                if (key && row.value) businessDetails[key] = row.value;
+            }
+
             seller.about = {
                 description: aboutData.aboutDescription,
-                location: aboutData.sellerInfoMap.location || null,
-                memberSince: aboutData.sellerInfoMap['member since'] || null,
-                businessDetails: Object.keys(aboutData.businessDetails).length ? aboutData.businessDetails : null
+                location: aboutLocation,
+                memberSince: aboutMemberSince,
+                businessDetails: Object.keys(businessDetails).length ? businessDetails : null
             };
             phase('about tab extracted');
 

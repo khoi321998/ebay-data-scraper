@@ -43,6 +43,12 @@ export interface ReviewsSummary {
 
 export interface Product {
     id: string | null;
+    /**
+     * Whether the listing is still live. `false` when eBay answered 404/410, served its soft-404
+     * layout, or rendered an ended notice with no buy box; `null` when we never got far enough to
+     * tell (bot wall, navigation failure).
+     */
+    isActive: boolean | null;
     title: string;
     brand: string | null;
     pricing: Pricing;

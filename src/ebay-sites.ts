@@ -111,6 +111,28 @@ export function siteFor(url: string): EbaySite {
     return resolveSite(url) ?? DEFAULT_SITE;
 }
 
+/**
+ * The canonical store URL to scrape: origin + path, no query, no fragment.
+ *
+ * Store URLs arrive carrying whatever the caller or the product page had on them — `_tab=feedback`
+ * copied straight out of a browser, `_trksid` tracking, `_pgn` paging. Unlike an item URL (where
+ * `?var=` picks the listing variation and must survive untouched), nothing in a store query string
+ * identifies the store, and `_tab` actively lands us on the wrong one: the item cards live on the
+ * shop tab, so a URL pinned to `_tab=feedback` yielded `storeItems: []` with nothing to explain it.
+ *
+ * Hub URLs are the exception and keep their query — `/sch/i.html?_ssn=x` carries the seller *in*
+ * the query, so stripping it would throw away the only identifying part of the URL.
+ */
+export function storeBaseUrl(url: string): string {
+    try {
+        const parsed = new URL(url);
+        if (!/\/(?:str|usr)\//i.test(parsed.pathname)) return url.replace(/\/+$/, '');
+        return `${parsed.origin}${parsed.pathname}`.replace(/\/+$/, '');
+    } catch (_) {
+        return url.replace(/\/+$/, '');
+    }
+}
+
 /** `es` → `es-ES,es;q=0.9,en;q=0.8` — keeps the Accept-Language header coherent with the domain. */
 export function acceptLanguageFor(s: EbaySite): string {
     const primary = `${s.lang}-${s.countryCode}`;
