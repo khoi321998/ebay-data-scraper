@@ -12,9 +12,10 @@ Usage: `node src/main-cheerio.js`  (or add npm script)
 */
 import "dotenv/config";
 
-import { Actor } from "apify";
+import { Actor, log as runLog } from "apify";
 import { CheerioCrawler, Dataset } from "crawlee";
 
+import { currentActorRunId } from "./actor-run.js";
 import type { ActorInput, CaptureMode, ParsedCurrency, Specification } from "./dto/index.js";
 import { siteFor } from "./ebay-sites.js";
 import { auditExtraction, emptyExtractionReport, type FieldCheck, logExtractionReport } from "./extraction-audit.js";
@@ -47,6 +48,8 @@ const CHEERIO_SELLER_CHECKS: FieldCheck[] = [
 
 void (async () => {
     await Actor.init();
+
+    runLog.info(`Actor run ID: ${currentActorRunId() ?? '(none — running locally)'}`);
 
     const input = await Actor.getInput<ActorInput>();
     const mode: CaptureMode = input?.mode || "product_and_seller";

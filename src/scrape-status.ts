@@ -19,6 +19,7 @@ as dead:
   - ended notice       heuristic — requires BOTH the status-message banner AND the absence of any
                        buy box, so a single selector rotting silently means "live", never "dead".
 */
+import { currentActorRunId } from './actor-run.js';
 import type {
     CaptureMode,
     Product,
@@ -163,6 +164,7 @@ export function blankScrapedItem(url: string, mode: CaptureMode, itemId: string 
     return {
         platform: 'ebay',
         url,
+        actorRunId: currentActorRunId(),
         capturedAt: new Date().toISOString(),
         captureMode: mode,
         success: true,

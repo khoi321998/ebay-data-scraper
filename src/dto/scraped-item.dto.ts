@@ -12,6 +12,12 @@ import type { SellerTechnical, Technical } from './technical.dto.js';
 export interface ScrapedItem extends ScrapeOutcome {
     platform: 'ebay';
     url: string;
+    /**
+     * The Apify run that wrote this record, or `null` when scraped locally. Required, never
+     * optional: a dataset appended to by several runs needs every row to say which one it came
+     * from, and an absent key would read as "older record" rather than "ran off-platform".
+     */
+    actorRunId: string | null;
     capturedAt: string;
     captureMode: CaptureMode;
     product: Product | null;

@@ -17,7 +17,7 @@ Response shape is stable across modes. Fields not applicable to a given mode are
 */
 import 'dotenv/config';
 
-import { Actor } from 'apify';
+import { Actor, log as runLog } from 'apify';
 import * as cheerio from "cheerio";
 import { Dataset, type Log,PlaywrightCrawler, ProxyConfiguration } from "crawlee";
 import fsSync from "fs";
@@ -26,6 +26,7 @@ import got from "got";
 import countries from "i18n-iso-countries";
 import type { Page, Request as PlaywrightRequest } from "playwright";
 
+import { currentActorRunId } from "./actor-run.js";
 import type {
     ActorInput,
     CaptureMode,
@@ -209,6 +210,10 @@ const namedShimContexts = new WeakSet<object>();
 
 void (async () => {
     await Actor.init();
+
+    // Printed once, up front: every pushed record carries this id, so the log and the dataset can be
+    // lined up from either end.
+    runLog.info(`Actor run ID: ${currentActorRunId() ?? '(none — running locally)'}`);
 
     let mode: CaptureMode = 'product_and_seller';
     let inputUrls: string[] = [];
@@ -812,6 +817,7 @@ void (async () => {
             platform: "ebay",
             // The scraper adds no params of its own, so this is the caller's URL as landed on.
             url: page.url(),
+            actorRunId: currentActorRunId(),
             capturedAt: new Date().toISOString(),
             captureMode: mode,
             // The gone/walled checks above already returned or threw, so reaching here means a live
