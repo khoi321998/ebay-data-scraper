@@ -1273,7 +1273,14 @@ void (async () => {
 
                 const detailedRatingRows = [...document.querySelectorAll('.fdbk-detail-seller-rating')].map(el => ({
                     label: el.querySelector('.fdbk-detail-seller-rating__label span')?.textContent?.trim() || null,
-                    valueText: el.querySelector('.fdbk-detail-seller-rating__value')?.textContent?.trim() || null,
+                    // The value cell holds two spans: the visible `4.9` and a screen-reader-only
+                    // `.fb-clipped` "4.9 out of 5 stars". Taking the cell's whole textContent glues
+                    // them into `4.94.9 out of 5 stars`, which parses as 4949 — so read the visible
+                    // span only.
+                    valueText: el.querySelector('.fdbk-detail-seller-rating__value span:not(.fb-clipped)')?.textContent?.trim() || null,
+                    // Same number as a plain, locale-independent attribute; used when the markup
+                    // changes and the span above stops matching.
+                    progressValue: el.querySelector('progress')?.getAttribute('value') || null,
                 }));
 
                 const storeStats = [...document.querySelectorAll('.str-seller-card__store-stats-content > div')].map(div => ({
@@ -1358,8 +1365,9 @@ void (async () => {
                 accurateDescription: null, shippingSpeed: null, communication: null, shippingCost: null,
             };
             raw.detailedRatingRows.forEach((row, i) => {
-                const value = parseAmount(row.valueText || '');
-                if (value === null) return;
+                const value = parseAmount(row.valueText || '') ?? parseAmount(row.progressValue || '');
+                // A DSR is a 0-5 star average; anything outside that came from markup we misread.
+                if (value === null || value < 0 || value > 5) return;
                 // eBay renders the four DSRs in a fixed order on every marketplace, so the position
                 // is the reliable key; the English label match just protects against a reorder.
                 const key = DSR_KEY_BY_LABEL(row.label)
