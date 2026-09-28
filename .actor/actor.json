@@ -6,7 +6,7 @@
     "version": "0.1",
     "meta": {
         "templateId": "js-crawlee-optimized",
-        "generatedBy": "Claude Code with Claude Opus 4.8"
+        "generatedBy": "Claude Code with Claude Opus 5.5"
     },
     "input": "./input_schema.json",
     "output": "./output_schema.json",

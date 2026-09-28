@@ -13,7 +13,7 @@
         "dotenv": "^16.4.5",
         "got": "^14.6.6",
         "i18n-iso-countries": "^7.12.0",
-        "playwright": "^1.59.1"
+        "playwright": "1.63.0"
     },
     "devDependencies": {
         "@apify/eslint-config": "^2.0.0",

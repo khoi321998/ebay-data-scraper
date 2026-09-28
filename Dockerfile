@@ -2,7 +2,7 @@
 # Base image WORKDIR is /home/myuser and it runs as the non-root user `myuser`.
 
 # ---- Build stage: install all deps (incl. TypeScript) and compile to dist/ ----
-FROM apify/actor-node-playwright-chrome:22-1.56.1 AS builder
+FROM apify/actor-node-playwright-chrome:22-1.63.0 AS builder
 
 # Copy package files first for better layer caching
 COPY --chown=myuser:myuser package*.json ./
@@ -16,7 +16,7 @@ COPY --chown=myuser:myuser . ./
 RUN npm run build
 
 # ---- Runtime stage: production deps + compiled output only ----
-FROM apify/actor-node-playwright-chrome:22-1.56.1
+FROM apify/actor-node-playwright-chrome:22-1.63.0
 
 # Copy package files and install only production dependencies
 COPY --chown=myuser:myuser package*.json ./
