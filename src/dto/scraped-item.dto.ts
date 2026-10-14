@@ -31,7 +31,11 @@ export interface ScrapedItem extends ScrapeOutcome {
 
 /** Shape of `request.userData` passed between crawler handlers. */
 export interface RequestUserData {
-    scrappedItem?: ScrapedItem;
+    /**
+     * Key of the record this request contributes to in the `RecordAssembler`. The record itself
+     * lives there, not here, because several requests write into it at the same time.
+     */
+    recordId?: string;
     sellerBaseUrl?: string;
     negativeUrl?: string | null;
     positiveUrl?: string | null;

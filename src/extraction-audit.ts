@@ -133,7 +133,7 @@ export const SCRAPED_ITEM_CHECKS: FieldCheck[] = [
     { path: 'product.paymentMethods', severity: 'warning', selector: 'i18n script blob → payments[].textSpans[].accessibilityText', when: hasProduct },
 
     // Seller pointer carried on product records in seller-bearing modes.
-    { path: 'sellerRef.displayName', severity: 'warning', selector: '.x-sellercard-atf__info__about-seller a .ux-textspans--BOLD', when: hasSellerRef },
+    { path: 'sellerRef.displayName', severity: 'warning', selector: '.x-sellercard-atf__info__about-seller a | .x-store-information h3 a | VISIT_STORE _ssn', when: hasSellerRef },
     { path: 'sellerRef.platformSellerId', severity: 'warning', selector: '.x-sellercard-atf__info__about-seller a[href] /str|/usr', when: hasSellerRef },
 
     // Seller section — only populated in seller_only / product_and_seller.

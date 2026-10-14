@@ -22,6 +22,15 @@
             },
             "default": ["https://www.ebay.com/itm/123456789"],
             "prefill": ["https://www.ebay.com/itm/123456789"]
+        },
+        "maxConcurrency": {
+            "title": "Max concurrency",
+            "type": "integer",
+            "description": "How many URLs are processed at the same time. Higher is faster; every 3 concurrent requests share one browser and one proxy IP, so higher values also spread the load over more IPs.",
+            "default": 10,
+            "minimum": 1,
+            "maximum": 50,
+            "editor": "number"
         }
     },
     "required": ["startUrls"]

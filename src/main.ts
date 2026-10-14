@@ -5,11 +5,20 @@ Input: {
   "startUrls": [ "<url>", ... ]
 }
 
-Flows:
-  product_only         ITEM → DESCRIPTION → ITEM_REVIEWS (negative ∥ positive) → pushData
-  seller_only          (SELLER_HUB if hub URL →) SELLER_STORE → SELLER_REVIEWS (negative ∥ positive) → pushData
-  product_and_seller   ITEM → DESCRIPTION → ITEM_REVIEWS (negative ∥ positive)
-                        → (SELLER_HUB →) SELLER_STORE → SELLER_REVIEWS (negative ∥ positive) → pushData
+Flows (∥ = runs concurrently; every branch starts as soon as its input is known — see
+record-assembly.ts — and the record is pushed once the last branch settles):
+  product_only         ITEM (∥ DESCRIPTION fetch ∥ review samples: negative ∥ positive ∥ neutral)
+  seller_only          (SELLER_HUB if hub URL →) SELLER_STORE (shop ∥ feedback tab ∥ about tab,
+                        then seller review samples: negative ∥ positive ∥ neutral)
+  product_and_seller   both of the above, the seller branch started by ITEM straight off the
+                        first paint of the product page
+
+Nothing is rendered on the happy path. Every page — item, seller hub, store shop/feedback/about
+tabs, review samples — is fetched as HTML through a browser session parked on the marketplace's
+/robots.txt (the "anchor", see anchorPageFor) and read with cheerio (html-fetch.ts,
+page-parsers.ts). When eBay will not serve a page that way it is rendered instead: ITEM, SELLER_HUB
+and SELLER_STORE on their own Crawlee page (loadPage), a store tab on a page of its own, review
+samples as an ITEM_REVIEWS / SELLER_REVIEWS request.
 
 Response shape is stable across modes. Fields not applicable to a given mode are null:
   - product_only  →  seller = null, sellerRef = null, sellerTechnical = null
@@ -19,12 +28,12 @@ import 'dotenv/config';
 
 import { Actor, log as runLog } from 'apify';
 import * as cheerio from "cheerio";
-import { Dataset, type Log,PlaywrightCrawler, ProxyConfiguration } from "crawlee";
+import { Dataset, type Log, PlaywrightCrawler, ProxyConfiguration } from "crawlee";
 import fsSync from "fs";
 import fs from "fs/promises";
 import got from "got";
 import countries from "i18n-iso-countries";
-import type { Page, Request as PlaywrightRequest } from "playwright";
+import type { BrowserContext, Page, Request as PlaywrightRequest } from "playwright";
 
 import { currentActorRunId } from "./actor-run.js";
 import type {
@@ -43,22 +52,37 @@ import type {
 import {
     acceptLanguageFor,
     DEFAULT_SITE,
+    type EbaySite,
     isEbayUrl,
     siteFor,
     storeBaseUrl,
 } from "./ebay-sites.js";
 import {
     auditExtraction,
-    emptyExtractionReport,
     logExtractionReport,
     SCRAPED_ITEM_CHECKS,
 } from "./extraction-audit.js";
+import { fetchHtml } from "./html-fetch.js";
+import {
+    buildAllItemsFeedbackUrls,
+    buildSellerFeedbackUrls,
+    hasReviewContent,
+    isCaptchaUrl,
+    readHubSellerUrl,
+    readItemRatings,
+    readItemReviewSamples,
+    readItemSellerLink,
+    readSellerReviewSamples,
+    readStoreAbout,
+    readStoreFeedback,
+    readStoreItems,
+} from "./page-parsers.js";
 import { parseAmount, parseCount, parseCurrency } from "./parse-currency.js";
+import { type AssemblyState, type Branch, BRANCH_BY_LABEL, RecordAssembler } from "./record-assembly.js";
 import {
     blankScrapedItem,
     blockedError,
     detectProductGone,
-    emptySellerSection,
     isGoneStatus,
     isSellerAlive,
     isWalled,
@@ -161,22 +185,23 @@ function feedbackTypeOf(href: string | null, label: string | null): 'positive' |
  * it costs the same full page load a `goto` does. One code path, same request count, and no
  * dependence on an anchor eBay never promised to keep.
  *
+ * Each tab gets its own `page` in the store's browser context (same cookies, proxy and session), so
+ * the shop, feedback and about tabs load concurrently instead of one `goto` after another.
+ *
+ * `landedUrl` is the store URL the crawler actually landed on, so the tabs keep whatever
+ * marketplace and redirect we ended up on; any `_tab` already in it is overwritten.
+ *
  * Returns whether the tab's content actually materialised.
  */
 async function openStoreTab(
     page: Page,
-    tab: 'shop' | 'feedback' | 'about',
+    landedUrl: string,
+    tab: 'feedback' | 'about',
     readySelector: string,
     log: Log,
 ): Promise<boolean> {
-    const isReady = async () => (await page.$(readySelector)) !== null;
-    // Already looking at it — the shop tab often renders the store card the other tabs need.
-    if (await isReady()) return true;
-
-    // `page.url()` is the base so we keep whatever marketplace and redirect we landed on, and
-    // overwrite any `_tab` already set by a previous call.
     try {
-        const target = new URL(page.url());
+        const target = new URL(landedUrl);
         target.searchParams.set('_tab', tab);
         log.info(`SELLER_STORE: loading ${tab} tab → ${target.toString()}`);
         await page.goto(target.toString(), { waitUntil: 'domcontentloaded', timeout: 30000 });
@@ -184,7 +209,76 @@ async function openStoreTab(
     } catch (err) {
         log.warning(`SELLER_STORE: ${tab} tab navigation failed`, { error: (err as Error).message });
     }
-    return isReady();
+    return !page.isClosed() && (await page.$(readySelector).catch(() => null)) !== null;
+}
+
+/**
+ * Whether fetched item HTML is a page we can use without rendering: the listing itself, or eBay's
+ * definitive "this listing is gone" layout (which the handler records as such).
+ */
+function isItemPage($: cheerio.CheerioAPI): boolean {
+    return $(STATUS_SELECTORS.productTitle).length > 0
+        || $(STATUS_SELECTORS.productPrice).length > 0
+        || detectProductGone($) !== null;
+}
+
+/**
+ * What a fetched item page is missing that a second fetch usually brings back, or `null` when it
+ * is complete (see the refetch in the ITEM handler).
+ */
+function itemPageGap($: cheerio.CheerioAPI, needSeller: boolean): string | null {
+    // Some responses come without the seller card; only a page with no seller link anywhere
+    // (see readItemSellerLink) is worth fetching again.
+    if (needSeller && !readItemSellerLink($, itemPageData($))) {
+        return 'seller link came back missing';
+    }
+    if ($('.x-feedback-detail-list').length > 0 && $('.fdbk-detail-list').length === 0) {
+        return 'feedback module came back empty (the lighter page variant)';
+    }
+    // Every listing has at least one gallery image, so a blob without one is a partial document.
+    if (!itemPageData($).includes('VIImageType')) return 'page data blob came back without the gallery';
+    return null;
+}
+
+/** The `$i18n` script blob that carries an item page's gallery, payments and seller data. */
+function itemPageData($: cheerio.CheerioAPI): string {
+    return $('script').toArray().map((el) => $(el).html() || '').find((t) => t.includes('Object.assign($i18n=window.$i18n')) ?? '';
+}
+
+/**
+ * The product's review-filter URLs ("This item" panel only), read off an already-parsed DOM.
+ *
+ * The feedback module has two tabs ("This item" / "All items"), each with its own filter dropdown
+ * pre-rendered in the DOM, so scope to the "This item" panel to avoid picking up "All items" URLs.
+ * eBay replaced the native `<select name="feedbackFilterDropdown">` with a custom
+ * "fake-menu-button" widget rendering `<a>` items with hrefs; both are read.
+ */
+function productFeedbackUrls(
+    $: cheerio.CheerioAPI,
+    baseUrl: string,
+): { negative: string | null; positive: string | null; neutral: string | null } {
+    const urls: { negative: string | null; positive: string | null; neutral: string | null } = {
+        negative: null, positive: null, neutral: null,
+    };
+    let panelId: string | undefined;
+    $('.fdbk-detail-list [role="tab"]').each((_i, tab) => {
+        if (!/^This item/i.test($(tab).text().trim())) return true;
+        panelId = $(tab).attr('aria-controls');
+        return false;
+    });
+    const linkSelector = 'a.fake-menu-button__item[href], select[name="feedbackFilterDropdown"] option';
+    const panel = panelId ? $(`[id="${panelId}"]`) : null;
+    const links = panel?.length ? panel.find(linkSelector) : $(linkSelector);
+    links.each((_i, el) => {
+        const raw = $(el).attr('href') || $(el).attr('value') || '';
+        if (!raw) return;
+        let val: string;
+        try { val = new URL(raw, baseUrl).toString(); } catch (_) { return; }
+        if (val.includes('commentType=NEGATIVE')) urls.negative = val;
+        else if (val.includes('commentType=POSITIVE')) urls.positive = val;
+        else if (val.includes('commentType=NEUTRAL')) urls.neutral = val;
+    });
+    return urls;
 }
 
 function makePhaseLogger(log: Log, label: string): (name: string) => void {
@@ -201,12 +295,159 @@ function makePhaseLogger(log: Log, label: string): (name: string) => void {
 
 const VALID_MODES = ['product_only', 'seller_only', 'product_and_seller'];
 
+/** Requests in flight at once unless the input says otherwise. */
+const DEFAULT_MAX_CONCURRENCY = 10;
+/**
+ * Requests sharing one browser, and so one proxy session / exit IP. Kept low on purpose: at 10
+ * requests through one IP eBay started serving pages without the seller card (2 of 11 items, both
+ * fetches) — at 3 per IP it had not happened in 40 fetches.
+ */
+const PAGES_PER_BROWSER = 3;
+
+type FeedbackType = 'negative' | 'positive' | 'neutral';
+const FEEDBACK_TYPES: FeedbackType[] = ['negative', 'positive', 'neutral'];
+type FeedbackUrls = Record<FeedbackType, string | null>;
+
 // Running via tsx/esbuild wraps named functions with a `__name()` helper that
 // only exists in the Node module scope. When such functions are serialized into
 // the browser via page.evaluate(), `__name` is undefined there → ReferenceError.
 // We define a no-op shim in every page of a context once (covers the secondary
 // review pages opened via context.newPage() too). Harmless under `node dist`.
 const namedShimContexts = new WeakSet<object>();
+
+/**
+ * Headers and init scripts every eBay page gets before it loads anything — what the pre-navigation
+ * hook used to do inline, shared now with the pages that skip Crawlee's navigation.
+ */
+async function preparePage(page: Page, site: EbaySite): Promise<void> {
+    // NOTE: do NOT use page.route() to block images/fonts/etc on eBay.
+    // It changes the resource-loading fingerprint and Akamai serves
+    // /splashui/captcha challenges on /fdbk/* (review/feedback) endpoints.
+    // Tested 2026-05-07: blocking caused all review URLs to hit captcha.
+    await page.setExtraHTTPHeaders({
+        // Must agree with the domain — an en-US header on ebay.es is an odd pairing that
+        // costs us fingerprint coherence for a page eBay serves in Spanish regardless.
+        'Accept-Language': acceptLanguageFor(site),
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Upgrade-Insecure-Requests': '1',
+    });
+    const context = page.context();
+    if (!namedShimContexts.has(context)) {
+        namedShimContexts.add(context);
+        await context.addInitScript(() => {
+            const g = globalThis as unknown as { __name?: (fn: unknown) => unknown };
+            if (!g.__name) g.__name = (fn) => fn;
+        });
+    }
+    await page.addInitScript(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        (window as unknown as { chrome: unknown }).chrome = { runtime: {} };
+    });
+}
+
+/**
+ * One long-lived page per browser context and marketplace, parked on that marketplace's
+ * `/robots.txt`.
+ *
+ * Item pages are fetched as HTML from inside it (html-fetch.ts). `fetch()` is bound by CORS, so
+ * all the anchor has to be is a document on the marketplace's origin — it does not need to be a
+ * rendered eBay page. Probed 2026-10-14 with a fresh browser per scenario: `/robots.txt` (no JS,
+ * ~0.4s), the homepage (which answers 403 to a fresh session) and the homepage plus a 2s wait all
+ * got `/itm/` back 200 and complete. Akamai's edge sets its `bm_*` cookies on every response, and
+ * no scenario ever earned the sensor's `_abck`, so what eBay trusts is that the request comes
+ * from a real Chrome, not a warm-up. The homepage warm-up it replaces cost 8.6s through the
+ * residential proxy.
+ *
+ * Resolves to `null` when the anchor will not load cleanly; the caller then renders.
+ */
+const anchorPages = new WeakMap<BrowserContext, Map<string, Promise<Page | null>>>();
+
+async function anchorPageFor(context: BrowserContext, site: EbaySite, log: Log): Promise<Page | null> {
+    let byOrigin = anchorPages.get(context);
+    if (!byOrigin) {
+        byOrigin = new Map();
+        anchorPages.set(context, byOrigin);
+    }
+    const cached = byOrigin.get(site.origin);
+    if (cached) {
+        return cached.then(async (anchor) => {
+            if (anchor && !anchor.isClosed()) return anchor;
+            // Closed (or never opened): forget it so this and later calls open a fresh one.
+            if (byOrigin.get(site.origin) === cached) byOrigin.delete(site.origin);
+            return anchorPageFor(context, site, log);
+        });
+    }
+    const opening = (async () => {
+        const t0 = Date.now();
+        const anchor = await context.newPage();
+        try {
+            await preparePage(anchor, site);
+            const res = await anchor.goto(`${site.origin}/robots.txt`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+            if (isCaptchaUrl(anchor.url()) || (res && res.status() >= 500)) {
+                throw new Error(`anchor answered ${res?.status()} at ${anchor.url()}`);
+            }
+            log.info(`ANCHOR: ${site.host} ready in ${Date.now() - t0}ms (robots.txt, status ${res?.status()})`);
+            return anchor;
+        } catch (err) {
+            log.warning(`ANCHOR: could not open ${site.host}, items there will be rendered`, { error: (err as Error).message });
+            await anchor.close().catch(() => {});
+            return null;
+        }
+    })();
+    byOrigin.set(site.origin, opening);
+    // A failed anchor is retried on the next item rather than cached for the browser's lifetime.
+    void opening.then((anchor) => { if (!anchor && byOrigin.get(site.origin) === opening) byOrigin.delete(site.origin); });
+    return opening;
+}
+
+interface LoadedPage {
+    $: cheerio.CheerioAPI;
+    /** Where we actually landed, after redirects. */
+    url: string;
+    status: number | undefined;
+    /** A page on the landed origin whose session can fetch further HTML (html-fetch.ts). */
+    htmlPage: Page;
+    rendered: boolean;
+}
+
+/**
+ * Load the URL of a request that skips Crawlee's navigation (ITEM, SELLER_HUB, SELLER_STORE).
+ *
+ * Fetched as HTML through the session's anchor page when eBay serves it that way and `isReady`
+ * finds what the handler needs; otherwise rendered on `page`, waiting up to `waitMs` for
+ * `waitSelector` the way these handlers always did. A rendered 403/429 or a landing on eBay's
+ * challenge page is the bot wall and throws for a retry on a fresh session — the check Crawlee's
+ * own navigation made before these requests stopped using it. A 404/410 comes back for the caller
+ * to record as gone.
+ */
+async function loadPage(
+    page: Page,
+    url: string,
+    opts: { label: string; isReady: ($: cheerio.CheerioAPI) => boolean; waitSelector: string; waitMs: number },
+    log: Log,
+): Promise<LoadedPage> {
+    const site = siteFor(url);
+    const anchor = await anchorPageFor(page.context(), site, log);
+    const fetched = anchor ? await fetchHtml(anchor, url, opts.isReady, log, opts.label) : null;
+    if (fetched) return { $: fetched.$, url: fetched.url, status: 200, htmlPage: anchor!, rendered: false };
+
+    log.info(`${opts.label}: rendering in the browser`, { url });
+    const t0 = Date.now();
+    await preparePage(page, site);
+    const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    const status = response?.status();
+    log.info(`${opts.label}: rendered navigation answered HTTP ${status} in ${Date.now() - t0}ms`, { url: page.url() });
+    if (status === 403 || status === 429) throw blockedError(status, true);
+    // The challenge pages answer 200 and carry eBay's header, so without this a walled store would
+    // read as a store that does not exist (SELLER_NOT_FOUND) instead of a retry.
+    if (isCaptchaUrl(page.url())) throw blockedError(status, true);
+    if (!isGoneStatus(status)) {
+        await page.waitForSelector(opts.waitSelector, { timeout: opts.waitMs })
+            .catch(() => log.warning(`${opts.label}: "${opts.waitSelector}" not rendered within ${opts.waitMs / 1000}s`, { url }));
+        log.info(`${opts.label}: rendered page ready in ${Date.now() - t0}ms`);
+    }
+    return { $: cheerio.load(await page.content()), url: page.url(), status, htmlPage: page, rendered: true };
+}
 
 void (async () => {
     await Actor.init();
@@ -217,10 +458,18 @@ void (async () => {
 
     let mode: CaptureMode = 'product_and_seller';
     let inputUrls: string[] = [];
+    let maxConcurrency = DEFAULT_MAX_CONCURRENCY;
     try {
         const input = await Actor.getInput<ActorInput>();
         mode = input?.mode || 'product_and_seller';
         inputUrls = input?.startUrls || input?.productUrls || input?.sellerUrls || [];
+        if (input?.maxConcurrency !== undefined) {
+            const requested = Math.round(Number(input.maxConcurrency));
+            maxConcurrency = Number.isFinite(requested) ? Math.min(Math.max(requested, 1), 50) : DEFAULT_MAX_CONCURRENCY;
+            if (maxConcurrency !== input.maxConcurrency) {
+                runLog.warning(`maxConcurrency ${input.maxConcurrency} is out of range, using ${maxConcurrency}`);
+            }
+        }
     } catch (err) {
         console.error("Failed to read input:", err);
         return;
@@ -245,6 +494,24 @@ void (async () => {
         if (inputUrls.length === 0) return;
     }
 
+    // Records being assembled by concurrently running branches — persisted, so a migration resumes
+    // them the way the old userData relay did.
+    const records = new RecordAssembler(
+        await Actor.useState<AssemblyState>('RECORDS_IN_PROGRESS', {}),
+        pushScrapedItem,
+    );
+
+    // A seller_only record starts from the input URL alone; the seller handlers create it on first
+    // contact, keyed by that URL.
+    const sellerSeed = (trimmed: string) => {
+        const seed = blankScrapedItem(trimmed, mode);
+        const seedSeller = seed.seller!;
+        seedSeller.profileUrl = trimmed;
+        const slugMatch = trimmed.match(/\/(?:str|usr)\/([^/?]+)/i);
+        if (slugMatch) seedSeller.ebayUsername = slugMatch[1];
+        return seed;
+    };
+
     // Build startUrls based on mode
     let startUrls;
     if (mode === 'seller_only') {
@@ -252,15 +519,12 @@ void (async () => {
             // Strips `_tab`/tracking off a /str/ or /usr/ URL; leaves a hub URL's query intact.
             const trimmed = storeBaseUrl(url);
             const isHub = /\/sch\/i\.html/i.test(trimmed) || /\/sch\/[^/]+\/m\.html/i.test(trimmed);
-            const seed = blankScrapedItem(trimmed, mode);
-            const seedSeller = seed.seller!;
-            seedSeller.profileUrl = trimmed;
-            const slugMatch = trimmed.match(/\/(?:str|usr)\/([^/?]+)/i);
-            if (slugMatch) seedSeller.ebayUsername = slugMatch[1];
             return {
                 url: trimmed,
                 label: isHub ? 'SELLER_HUB' : 'SELLER_STORE',
-                userData: isHub ? { scrappedItem: seed } : { scrappedItem: seed, sellerBaseUrl: trimmed }
+                // Loaded through loadPage(), like ITEM.
+                skipNavigation: true,
+                userData: isHub ? { recordId: trimmed } : { recordId: trimmed, sellerBaseUrl: trimmed }
             };
         });
     } else {
@@ -286,6 +550,9 @@ void (async () => {
             return {
                 url,
                 label: 'ITEM',
+                // The handler fetches the item as HTML through an anchor page on the origin and only
+                // navigates (renders) this page itself when that is refused.
+                skipNavigation: true,
                 userData: {}
             };
         });
@@ -320,11 +587,29 @@ void (async () => {
         : undefined;
     console.log(`Using Apify RESIDENTIAL proxy, countries: ${[...proxyByCountry.keys()].join(', ') || 'none'}`);
 
+    // ITEM requests are the caller's own URLs, so their record is keyed by the request itself; every
+    // request a record spawns afterwards carries that key in userData.
+    const recordIdOf = (request: { uniqueKey: string; userData: Record<string, unknown> }) =>
+        (request.userData as RequestUserData).recordId ?? request.uniqueKey;
+
     const crawler = new PlaywrightCrawler({
         proxyConfiguration,
         requestHandlerTimeoutSecs: 300,
+        // A request is mostly HTML fetches now (only the anchor is a rendered page), so far more
+        // of them fit at once than when every one rendered its listing.
         minConcurrency: 1,
-        maxConcurrency: 3,
+        maxConcurrency,
+        // Start at full concurrency. The pool otherwise starts at minConcurrency and grows by 5%
+        // every 10s, so the seller branch ITEM enqueues off the first paint sat in the queue until
+        // the item request finished — 8.7s of a 37s run through the residential proxy. The pool
+        // still scales down on its own if the machine runs short of CPU or memory.
+        autoscaledPoolOptions: { desiredConcurrency: maxConcurrency },
+        browserPoolOptions: {
+            // Every page of a browser shares its proxy session — one exit IP — and each request
+            // fans out into 3-4 fetches. Capping pages per browser spreads a high concurrency over
+            // several browsers, so several IPs, each with its own anchor page.
+            maxOpenPagesPerBrowser: PAGES_PER_BROWSER,
+        },
         maxRequestRetries: 5,
         useSessionPool: true,
         sessionPoolOptions: { maxPoolSize: 20 },
@@ -341,40 +626,10 @@ void (async () => {
         preNavigationHooks: [
             async ({ page, request }) => {
                 const site = siteFor(request.url);
-                // NOTE: do NOT use page.route() to block images/fonts/etc on eBay.
-                // It changes the resource-loading fingerprint and Akamai serves
-                // /splashui/captcha challenges on /fdbk/* (review/feedback) endpoints.
-                // Tested 2026-05-07: blocking caused all review URLs to hit captcha.
-                await page.setExtraHTTPHeaders({
-                    // Must agree with the domain — an en-US header on ebay.es is an odd pairing that
-                    // costs us fingerprint coherence for a page eBay serves in Spanish regardless.
-                    'Accept-Language': acceptLanguageFor(site),
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-                    'Upgrade-Insecure-Requests': '1',
-                });
-                const context = page.context();
-                if (!namedShimContexts.has(context)) {
-                    namedShimContexts.add(context);
-                    await context.addInitScript(() => {
-                        const g = globalThis as unknown as { __name?: (fn: unknown) => unknown };
-                        if (!g.__name) g.__name = (fn) => fn;
-                    });
-                }
-                await page.addInitScript(() => {
-                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                    (window as unknown as { chrome: unknown }).chrome = { runtime: {} };
-                });
-                // Warm session on first visit to avoid Akamai cold-start 403.
-                // Each marketplace sets its own cookies (.ebay.es cookies do not come from
-                // ebay.com), so warm the origin we are about to hit — not a hard-coded one.
-                if (request.label === 'ITEM' || request.label === 'SELLER_STORE' || request.label === 'SELLER_HUB') {
-                    const cookies = await page.context().cookies(site.origin);
-                    if (cookies.length === 0) {
-                        await page.goto(site.origin, { waitUntil: 'domcontentloaded', timeout: 15000 })
-                            .catch(() => {});
-                        await page.waitForTimeout(1500 + Math.random() * 1000);
-                    }
-                }
+                // Only the rendered fallbacks (ITEM_REVIEWS / SELLER_REVIEWS) still navigate through
+                // Crawlee. ITEM, SELLER_HUB and SELLER_STORE skip it and load via loadPage(); the
+                // homepage warm-up that used to run here for them turned out to be unnecessary.
+                await preparePage(page, site);
             }
         ],
         postNavigationHooks: [
@@ -406,8 +661,9 @@ void (async () => {
             },
         ],
         // A request that exhausts its retries used to vanish from the dataset entirely, so a caller
-        // could not tell "eBay blocked us" from "we never got asked to scrape it". Push whatever the
-        // chain had assembled so far (or an empty record of the right shape) carrying the reason.
+        // could not tell "eBay blocked us" from "we never got asked to scrape it". Settle the branch
+        // with the reason, so the record still ships with whatever the other branches assembled —
+        // or, when no handler ever got to start one, push an empty record of the right shape.
         failedRequestHandler: async ({ request, log }, error) => {
             const message = error?.message || 'Unknown error';
             log.error(`Request failed: ${request.url}`, {
@@ -415,22 +671,26 @@ void (async () => {
                 retryCount: request.retryCount,
                 error: message,
             });
-            const carried = (request.userData as RequestUserData).scrappedItem;
-            const scrappedItem = carried ?? blankScrapedItem(request.url, mode);
             // `blockedError` and the navigation timeouts that follow a bot wall are the same story:
             // eBay would not serve us the page. Anything else is a plain navigation failure.
             const blocked = /blocked|captcha|403|429|Timeout/i.test(message);
-            markFailure(
-                scrappedItem,
-                blocked ? 'BLOCKED' : 'NAVIGATION_FAILED',
-                `${request.label ?? 'REQUEST'} gave up after ${request.retryCount} retries on ${request.url}: ${message}`,
-            );
+            const code = blocked ? 'BLOCKED' : 'NAVIGATION_FAILED';
+            const detail = `${request.label ?? 'REQUEST'} gave up after ${request.retryCount} retries on ${request.url}: ${message}`;
+
+            const recordId = recordIdOf(request);
+            const branch = BRANCH_BY_LABEL[request.label ?? ''];
+            if (branch && records.has(recordId)) {
+                await records.fail(recordId, branch, code, detail, log);
+                return;
+            }
+            const scrappedItem = mode === 'seller_only' ? sellerSeed(recordId) : blankScrapedItem(request.url, mode);
+            markFailure(scrappedItem, code, detail);
             await pushScrapedItem(scrappedItem, log);
         },
     });
 
     // ──────────────────── ITEM ────────────────────
-    crawler.router.addHandler("ITEM", async ({ page, request, response, parseWithCheerio, log }) => {
+    crawler.router.addHandler("ITEM", async ({ page, request, log }) => {
         const phase = makePhaseLogger(log, 'ITEM');
         phase('handler start');
 
@@ -442,16 +702,11 @@ void (async () => {
         const platformItemId = platformMatch ? platformMatch[1] : null;
         const requestSite = siteFor(request.url);
 
-        // Listing removed from the platform: definitive, so record it and skip the rest of the
-        // handler rather than spending 20s waiting for a title that will never render.
-        const httpStatus = response?.status();
-        if (isGoneStatus(httpStatus)) {
-            const gone = blankScrapedItem(request.url, mode, platformItemId);
-            gone.product!.isActive = false;
-            markFailure(gone, 'PRODUCT_NOT_FOUND', `eBay returned HTTP ${httpStatus} for this listing`);
-            await pushScrapedItem(gone, log);
-            return;
-        }
+        // Opened first, so the review and seller branches started below have a record to write
+        // into while this handler is still parsing. A retry reuses it as the branches left it.
+        const recordId = recordIdOf(request);
+        records.open(recordId, 'ITEM', () => blankScrapedItem(request.url, mode, platformItemId));
+        const record = records.get(recordId);
 
         // Plain `got` (not gotScraping) — itm.ebaydesc.com has no Akamai, no
         // browser fingerprint needed. No proxy needed either. The host is shared by every
@@ -479,22 +734,37 @@ void (async () => {
         // };
         // page.on('request', requestTracker);
 
-        // Resolve as soon as the critical listing DOM is painted (title + price).
-        // Falls through after 20s max if eBay's slow; cheerio parsing tolerates partial DOM.
-        await page.waitForSelector('h1.x-item-title__mainTitle, div.x-price-primary', { timeout: 20000 })
-            .catch(() => log.warning('ITEM: main title/price not rendered within 20s'));
-        phase('main DOM rendered (h1/price wait)');
-        const $ = await parseWithCheerio();
-        phase('first parseWithCheerio done');
+        // Everything the listing record needs is in the server-rendered HTML (raw vs rendered matched
+        // field for field on 2026-10-14, rating histogram and delivery estimate included), so fetch
+        // it through the session's anchor page instead of rendering this one.
+        const loaded = await loadPage(page, request.url, {
+            label: 'ITEM',
+            isReady: isItemPage,
+            // Resolve as soon as the critical listing DOM is painted (title + price). Falls through
+            // after 20s max if eBay's slow; cheerio parsing tolerates partial DOM.
+            waitSelector: 'h1.x-item-title__mainTitle, div.x-price-primary',
+            waitMs: 20000,
+        }, log);
+        let { $ } = loaded;
+        const { url: landedUrl, status: httpStatus, rendered } = loaded;
+        // The page whose session fetches the review HTML — sits on the listing's origin.
+        const { htmlPage } = loaded;
+        phase(rendered ? 'main DOM rendered' : 'item fetched as HTML');
+
+        // Listing removed from the platform: definitive, so record it and skip the rest.
+        if (isGoneStatus(httpStatus)) {
+            record.product!.isActive = false;
+            await records.fail(recordId, 'ITEM', 'PRODUCT_NOT_FOUND', `eBay returned HTTP ${httpStatus} for this listing`, log);
+            return;
+        }
 
         // eBay's soft-404 / ended-listing layouts arrive with HTTP 200, so they can only be told
         // apart here, from the DOM.
         const goneReason = detectProductGone($);
         if (goneReason) {
-            const gone = blankScrapedItem(page.url(), mode, platformItemId);
-            gone.product!.isActive = false;
-            markFailure(gone, 'PRODUCT_NOT_FOUND', goneReason);
-            await pushScrapedItem(gone, log);
+            record.url = landedUrl;
+            record.product!.isActive = false;
+            await records.fail(recordId, 'ITEM', 'PRODUCT_NOT_FOUND', goneReason, log);
             return;
         }
 
@@ -505,9 +775,23 @@ void (async () => {
             throw blockedError(httpStatus, !isWalled($));
         }
 
+        // eBay does not always send the same /itm/ document. Seen on 2026-10-14: about 1 in 3
+        // responses is a lighter variant whose feedback module ships empty (no request fills it in
+        // later, rendered or not), and 2 in 30 came without the gallery/payments data in the
+        // `$i18n` blob. Everything else on those pages matched, so one more fetch usually gets the
+        // full document; a listing that genuinely has no item feedback just costs that one fetch.
+        const needSeller = mode !== 'product_only';
+        const incomplete = !rendered && itemPageGap($, needSeller);
+        if (incomplete) {
+            log.info(`ITEM: ${incomplete}, fetching once more`, { url: request.url });
+            const again = await fetchHtml(htmlPage, request.url, ($doc) => isItemPage($doc) && !itemPageGap($doc, needSeller), log, 'ITEM (refetch)');
+            if (again) $ = again.$;
+            phase(again ? 'item re-fetched complete' : `item still incomplete (${incomplete}), using the first copy`);
+        }
+
         // Re-resolve after navigation: the smaller marketplaces redirect to a bigger one, and from
         // here on every relative URL and currency default must follow where we actually landed.
-        const site = siteFor(page.url());
+        const site = siteFor(landedUrl);
         if (site.host !== requestSite.host) {
             log.info(`ITEM: redirected ${requestSite.host} → ${site.host}, following that marketplace`);
         }
@@ -528,9 +812,9 @@ void (async () => {
             .first()
             .html() || "";
 
-        const sellerAnchor = $('.x-sellercard-atf__info__about-seller a');
-        const profileUrl = sellerAnchor.attr('href') || null;
-        const displayName = sellerAnchor.find('.ux-textspans--BOLD').text().trim() || null;
+        const sellerLink = readItemSellerLink($, scriptContent);
+        const profileUrl = sellerLink?.href ?? null;
+        const displayName = sellerLink?.name ?? null;
         const entityIdMatch = scriptContent.match(/"entity_id"\s*:\s*"~([^"]+)"/);
         const ebayUsername = entityIdMatch ? entityIdMatch[1] : null;
 
@@ -552,6 +836,37 @@ void (async () => {
                 } catch (_) {}
             }
         }
+
+        // The seller card is part of the first paint, so the whole seller branch can start now
+        // instead of after this page and its reviews are done.
+        if (record.seller) {
+            // Seeded once: on a retry the seller branch may already have replaced these with what
+            // the store page says.
+            if (!record.seller.profileUrl) {
+                if (profileUrl) {
+                    try {
+                        record.seller.profileUrl = new URL(profileUrl, site.origin).toString();
+                    } catch (_) {
+                        record.seller.profileUrl = profileUrl;
+                    }
+                } else if (ebayUsername) {
+                    // No seller link anywhere even after the refetch, but the page data still names the
+                    // seller. /usr/{username} is where the hub fallback lands for such sellers too.
+                    record.seller.profileUrl = `${site.origin}/usr/${encodeURIComponent(ebayUsername)}`;
+                    log.info(`ITEM: no seller link anywhere on the page, using the seller's profile from the page data → ${record.seller.profileUrl}`);
+                }
+                record.seller.displayName = displayName;
+                record.seller.ebayUsername = ebayUsername;
+            }
+            record.sellerRef = { platformSellerId, displayName, ebayUsername };
+            await startSellerBranch(recordId, record, log);
+            phase('seller branch started');
+        }
+
+        // Same for the reviews, when their filter links are already in the server-rendered DOM;
+        // otherwise they are looked for again once the feedback widget has had a chance to load.
+        let reviewsTask = startItemReviews(recordId, htmlPage, productFeedbackUrls($, landedUrl), log);
+        if (reviewsTask) phase('item reviews fetch started');
 
         await fs.writeFile('scriptContent.js', scriptContent).catch(err => console.error('Error logging script:', err));
 
@@ -647,32 +962,31 @@ void (async () => {
 
         phase('cheerio metadata extracted');
 
-        await page.evaluate(() => {
-            const el = document.querySelector('.x-feedback-detail-list, .ux-summary__start--rating, [class*="reviews"]');
-            if (el) el.scrollIntoView();
-        });
-        // Reduced from 8s to 3s. Widget often lazy-loads beyond 3s but rating
-        // data is non-critical and items without reviews never render the widget anyway.
-        await page.waitForSelector('span.ux-summary__start--rating, div.ux-histogram__item--bar', { timeout: 3000 }).catch(() => {});
-        phase('rating section ready (scroll+wait)');
-
-        const { rating, reviewCount, ratingBreakdown } = await page.evaluate(() => {
-            const ratingText = document.querySelector('span.ux-summary__start--rating .ux-textspans')?.textContent?.trim() || '';
-            const rating = parseFloat(ratingText) || null;
-            const tabText = document.querySelector('div.x-feedback-detail-list .tabs__item')?.textContent?.trim() || '';
-            const tabMatch = tabText.match(/\((\d[\d,]*)\)/);
-            const countText = document.querySelector('span.ux-summary__count .ux-textspans')?.textContent?.trim() || '';
-            const reviewCount = tabMatch
-                ? parseInt(tabMatch[1].replace(/,/g, ''), 10)
-                : parseInt(countText.split(' ')[0], 10) || null;
-            const ratingBreakdown: Record<number, number> = {};
-            document.querySelectorAll('div.ux-histogram__item--bar').forEach(el => {
-                const stars = parseInt(el.querySelector('.ux-histogram__item--bar--stars')?.textContent?.trim() || '', 10);
-                const count = parseInt(el.querySelector('.ux-histogram__item--bar--c span')?.textContent?.trim() || '', 10);
-                if (!Number.isNaN(stars) && !Number.isNaN(count)) ratingBreakdown[stars] = count;
+        if (rendered) {
+            await page.evaluate(() => {
+                const el = document.querySelector('.x-feedback-detail-list, .ux-summary__start--rating, [class*="reviews"]');
+                if (el) el.scrollIntoView();
             });
-            return { rating, reviewCount, ratingBreakdown };
-        });
+            // Reduced from 8s to 3s. Widget often lazy-loads beyond 3s but rating
+            // data is non-critical and items without reviews never render the widget anyway.
+            await page.waitForSelector('span.ux-summary__start--rating, div.ux-histogram__item--bar', { timeout: 3000 }).catch(() => {});
+            $ = cheerio.load(await page.content());
+            phase('rating section ready (scroll+wait)');
+            if (!reviewsTask) {
+                reviewsTask = startItemReviews(recordId, htmlPage, productFeedbackUrls($, landedUrl), log);
+                if (reviewsTask) phase('item reviews fetch started (after feedback widget load)');
+            }
+        }
+        if (!reviewsTask && platformItemId && ebayUsername && $('.x-feedback-detail-list').length > 0) {
+            // The feedback module is there but lazy — eBay fills it with the seller's "All items"
+            // filters after render. Build those links instead of rendering for them.
+            log.info('ITEM: feedback module is lazy-loaded, building its filter links');
+            reviewsTask = startItemReviews(recordId, htmlPage, buildAllItemsFeedbackUrls(site.origin, platformItemId, ebayUsername), log);
+            if (reviewsTask) phase('item reviews fetch started (built links)');
+        }
+        if (!reviewsTask) log.warning('No product feedback URL found, skipping product reviews');
+
+        const { rating, reviewCount, ratingBreakdown } = readItemRatings($);
 
         // Images from PICTURE.mediaList JSON. Each gallery image is a VIImageType
         // whose thumbnail carries the URL. IMPORTANT: only eBay-hosted images have
@@ -757,11 +1071,14 @@ void (async () => {
 
         const shippingOptions: ShippingOption[] = [];
 
-        await page.waitForSelector('div.ux-labels-values--deliverto .ux-labels-values__values-content', { timeout: 3000 })
-            .catch(() => {});
-        // [technical] page.off('request', requestTracker);
-
-        const $after = await parseWithCheerio();
+        // Fetched HTML already holds the delivery block; a rendered page may still be painting it.
+        let $after = $;
+        if (rendered) {
+            await page.waitForSelector('div.ux-labels-values--deliverto .ux-labels-values__values-content', { timeout: 3000 })
+                .catch(() => {});
+            // [technical] page.off('request', requestTracker);
+            $after = cheerio.load(await page.content());
+        }
 
         // Extract shipping cost + method directly from the page DOM (no modal click).
         const shippingValuesFirstDiv = $after('div.ux-labels-values--shipping div.ux-labels-values__values-content > div').first();
@@ -813,88 +1130,40 @@ void (async () => {
             }
         }
 
-        const scrappedItem: ScrapedItem = {
-            platform: "ebay",
-            // The scraper adds no params of its own, so this is the caller's URL as landed on.
-            url: page.url(),
-            actorRunId: currentActorRunId(),
-            capturedAt: new Date().toISOString(),
-            captureMode: mode,
-            // The gone/walled checks above already returned or threw, so reaching here means a live
-            // listing. pushScrapedItem() flips these if the audit finds the parse produced nothing.
-            success: true,
-            errorCode: null,
-            errorMessage: null,
-            product: {
-                id: platformItemId,
-                isActive: true,
-                title, brand,
-                pricing: { currency, priceMin, priceMax, localized },
-                stock: { availableQuantity, soldCount },
-                shipping: { deliveryTimeText },
-                paymentMethods,
-                description: { html: null, plainText: null },
-                specifications,
-                media: { images, videos: [] },
-                reviewsSummary: {
-                    rating, reviewCount, ratingBreakdown,
-                    negativeReviewSamples: [], positiveReviewSamples: [], neutralReviewSamples: []
-                }
-            },
-            sellerRef: mode === 'product_only' ? null : { platformSellerId, displayName, ebayUsername },
-            seller: mode === 'product_only' ? null : emptySellerSection(),
-            // [technical] temporarily commented out the technical processing
-            technical: null,
-            // technical: {
-            //     scriptBlocks, jsonState, dataAttributes,
-            //     rawUrlParameters: Object.fromEntries(urlObj.searchParams.entries()),
-            //     experimentIds: [], trackingIds: { googleAnalytics, facebookPixel },
-            //     pageContext, fulfilmentCodes: [], jsBundles, cssBundles, apiEndpoints
-            // },
-            sellerTechnical: null,
-            // Filled in by pushScrapedItem() once every handler has had its turn.
-            extraction: emptyExtractionReport()
+        // Started right after the first paint; by now it has usually long finished.
+        const fetchedSamples = (await reviewsTask) ?? {};
+        phase('item reviews fetched');
+
+        // Fill in the product on the record the branches are already writing into. Everything they
+        // own — the review samples, the seller section, a failure one of them recorded — is kept.
+        const sampleSoFar = record.product!.reviewsSummary;
+        // The scraper adds no params of its own, so this is the caller's URL as landed on.
+        record.url = landedUrl;
+        record.product = {
+            id: platformItemId,
+            isActive: true,
+            title, brand,
+            pricing: { currency, priceMin, priceMax, localized },
+            stock: { availableQuantity, soldCount },
+            shipping: { deliveryTimeText },
+            paymentMethods,
+            description: { html: null, plainText: null },
+            specifications,
+            media: { images, videos: [] },
+            reviewsSummary: {
+                rating, reviewCount, ratingBreakdown,
+                negativeReviewSamples: fetchedSamples.negative ?? sampleSoFar.negativeReviewSamples,
+                positiveReviewSamples: fetchedSamples.positive ?? sampleSoFar.positiveReviewSamples,
+                neutralReviewSamples: fetchedSamples.neutral ?? sampleSoFar.neutralReviewSamples,
+            }
         };
-
-        // Seed the seller section with what we already know from the product page
-        if (scrappedItem.seller) {
-            if (profileUrl) {
-                try {
-                    scrappedItem.seller.profileUrl = new URL(profileUrl, site.origin).toString();
-                } catch (_) {
-                    scrappedItem.seller.profileUrl = profileUrl;
-                }
-            }
-            scrappedItem.seller.displayName = displayName;
-            scrappedItem.seller.ebayUsername = ebayUsername;
-        }
-
-        const feedbackUrls = await page.evaluate(() => {
-            // The feedback module has two tabs ("This item" / "All items"), each
-            // with its own filter dropdown pre-rendered in the DOM. Scope to the
-            // "This item" panel so we don't pick up "All items" URLs.
-            const tabs = document.querySelectorAll('.fdbk-detail-list [role="tab"]');
-            let panel: HTMLElement | null = null;
-            for (const tab of tabs) {
-                if (/^This item/i.test(tab.textContent?.trim() || '')) {
-                    const panelId = tab.getAttribute('aria-controls');
-                    if (panelId) panel = document.getElementById(panelId);
-                    break;
-                }
-            }
-            const scope = panel || document;
-            // eBay replaced the native <select name="feedbackFilterDropdown"> with a
-            // custom "fake-menu-button" widget rendering <a> items with hrefs.
-            const links = scope.querySelectorAll('a.fake-menu-button__item[href], select[name="feedbackFilterDropdown"] option');
-            const urls: { negative: string | null; positive: string | null; neutral: string | null } = { negative: null, positive: null, neutral: null };
-            links.forEach(el => {
-                const val = (el as HTMLAnchorElement).href || (el as HTMLOptionElement).value || '';
-                if (val.includes('commentType=NEGATIVE')) urls.negative = val;
-                else if (val.includes('commentType=POSITIVE')) urls.positive = val;
-                else if (val.includes('commentType=NEUTRAL')) urls.neutral = val;
-            });
-            return urls;
-        });
+        // [technical] temporarily commented out the technical processing
+        // record.technical = {
+        //     scriptBlocks, jsonState, dataAttributes,
+        //     rawUrlParameters: Object.fromEntries(urlObj.searchParams.entries()),
+        //     experimentIds: [], trackingIds: { googleAnalytics, facebookPixel },
+        //     pageContext, fulfilmentCodes: [], jsBundles, cssBundles, apiEndpoints
+        // };
 
         // Await the description fetch we kicked off at the top of the handler.
         // By now, ~5-10s of Playwright work has happened in parallel, so the
@@ -903,8 +1172,8 @@ void (async () => {
         if (descRes && descRes.statusCode === 200 && descRes.body) {
             const $desc = cheerio.load(descRes.body);
             $desc('script, style').remove();
-            scrappedItem.product!.description.html = $desc.html();
-            scrappedItem.product!.description.plainText = $desc('body').text().replace(/\s+/g, ' ').trim();
+            record.product.description.html = $desc.html();
+            record.product.description.plainText = $desc('body').text().replace(/\s+/g, ' ').trim();
         } else if (descRes) {
             log.warning(`DESCRIPTION fetch ${descRes.statusCode}`, { itemId: platformItemId });
         } else {
@@ -912,28 +1181,8 @@ void (async () => {
         }
         phase('description awaited (parallel got)');
 
-        log.info(`ITEM feedbackUrls: negative=${feedbackUrls?.negative} | positive=${feedbackUrls?.positive} | neutral=${feedbackUrls?.neutral}`);
-
-        // Enqueue ITEM_REVIEWS directly (DESCRIPTION queue round-trip removed)
-        if (feedbackUrls?.negative || feedbackUrls?.positive || feedbackUrls?.neutral) {
-            // Primary URL drives Crawlee navigation; the others are opened on
-            // secondary pages inside ITEM_REVIEWS so all scrape concurrently in one handler.
-            const primary = feedbackUrls.negative || feedbackUrls.positive || feedbackUrls.neutral;
-            await crawler.addRequests([{
-                url: primary!,
-                label: "ITEM_REVIEWS",
-                userData: {
-                    scrappedItem,
-                    negativeUrl: feedbackUrls.negative || null,
-                    positiveUrl: feedbackUrls.positive || null,
-                    neutralUrl: feedbackUrls.neutral || null,
-                }
-            }]);
-        } else {
-            log.warning('No product feedback URL found, skipping product reviews, going to seller');
-            await chainToSeller(scrappedItem, log);
-        }
-        phase('ITEM handler done (enqueued next)');
+        await records.settle(recordId, 'ITEM', log);
+        phase('ITEM handler done');
     });
 
     // ──────────────────── ITEM_REVIEWS ────────────────────
@@ -944,7 +1193,7 @@ void (async () => {
         phase('handler start');
 
         const userData = request.userData as RequestUserData;
-        const scrappedItem = userData.scrappedItem!;
+        const recordId = recordIdOf(request);
         const { negativeUrl, positiveUrl, neutralUrl } = userData;
 
         // eBay renders both "This item" and "All items" tabpanels in the DOM
@@ -1038,62 +1287,130 @@ void (async () => {
             await Promise.all(tasks);
             phase('parallel review pages scraped');
 
-            scrappedItem.product!.reviewsSummary.negativeReviewSamples = samplesByType.negative;
-            scrappedItem.product!.reviewsSummary.positiveReviewSamples = samplesByType.positive;
-            scrappedItem.product!.reviewsSummary.neutralReviewSamples = samplesByType.neutral;
+            // Looked up only now: ITEM swaps in the full product object when it finishes, and that
+            // may have happened while these pages were loading.
+            // Only the types this fallback was handed — the others were already fetched as HTML.
+            const { reviewsSummary } = records.get(recordId).product!;
+            if (negativeUrl) reviewsSummary.negativeReviewSamples = samplesByType.negative;
+            if (positiveUrl) reviewsSummary.positiveReviewSamples = samplesByType.positive;
+            if (neutralUrl) reviewsSummary.neutralReviewSamples = samplesByType.neutral;
             log.info(`ITEM_REVIEWS: negative=${samplesByType.negative.length}, positive=${samplesByType.positive.length}, neutral=${samplesByType.neutral.length}`);
 
-            await chainToSeller(scrappedItem, log);
-            phase('ITEM_REVIEWS handler done (chained to seller)');
+            await records.settle(recordId, 'ITEM_REVIEWS', log);
+            phase('ITEM_REVIEWS handler done');
         } finally {
             for (const p of secondaryPages) await p.close().catch(() => {});
         }
     });
 
-    // Helper: after product flow done, chain into seller flow.
-    // If mode is product_only, push data and stop here.
-    // If the product page's seller link goes to an intermediate /sch/i.html hub,
-    // route through SELLER_HUB first to resolve the real seller URL from the DOM.
-    // Otherwise, go straight to SELLER_STORE.
-    async function chainToSeller(scrappedItem: ScrapedItem, log: Log) {
-        if (mode === 'product_only') {
-            await pushScrapedItem(scrappedItem, log);
-            return;
+    // ──────────────────── Branch starters ────────────────────
+    // A branch request is enqueued at the front of the queue, so records already in flight finish
+    // before new input URLs are started, and keyed per record, so that a retried parent cannot
+    // enqueue it twice while two records pointing at the same seller still get one request each.
+    async function enqueueBranch(recordId: string, label: string, url: string, userData: RequestUserData) {
+        await crawler.addRequests([{
+            url,
+            label,
+            uniqueKey: `${label}|${recordId}`,
+            // These load their page through loadPage(); the review fallbacks are rendered by Crawlee.
+            skipNavigation: label === 'SELLER_HUB' || label === 'SELLER_STORE',
+            userData: { ...userData, recordId },
+        }], { forefront: true });
+    }
+
+    /** Open `branch` on the record and enqueue its first request — once per record, however often called. */
+    async function startBranch(recordId: string, branch: Branch, label: string, url: string, userData: RequestUserData) {
+        if (!records.open(recordId, branch)) return;
+        try {
+            await enqueueBranch(recordId, label, url, userData);
+        } catch (err) {
+            records.abandon(recordId, branch);
+            throw err;
         }
-        const sellerUrl = scrappedItem.seller?.profileUrl;
+    }
+
+    /**
+     * Review samples for every feedback type that has a URL, fetched concurrently as HTML through
+     * `page` — no extra page, no rendering. Each type eBay would not serve that way is started as
+     * a browser branch (`label`) instead, carrying only the URLs still missing, so the samples
+     * already fetched are not scraped twice. Never rejects: a failure becomes that fallback.
+     */
+    async function fetchReviewSamples(
+        recordId: string,
+        page: Page,
+        urls: FeedbackUrls,
+        read: (dom: cheerio.CheerioAPI) => ReviewSample[],
+        branch: Branch,
+        label: string,
+        log: Log,
+    ): Promise<Partial<Record<FeedbackType, ReviewSample[]>>> {
+        const samples: Partial<Record<FeedbackType, ReviewSample[]>> = {};
+        const blocked: FeedbackUrls = { negative: null, positive: null, neutral: null };
+        await Promise.all(FEEDBACK_TYPES.map(async (type) => {
+            const url = urls[type];
+            if (!url) return;
+            const fetched = await fetchHtml(page, url, hasReviewContent, log, `${label}_${type.toUpperCase()}`);
+            if (fetched) samples[type] = read(fetched.$);
+            else blocked[type] = url;
+        }));
+
+        // Primary URL drives Crawlee navigation; the others are opened on secondary pages inside
+        // the fallback handler so all scrape concurrently there too.
+        const fallback = blocked.negative || blocked.positive || blocked.neutral;
+        if (fallback) {
+            try {
+                await startBranch(recordId, branch, label, fallback, {
+                    negativeUrl: blocked.negative,
+                    positiveUrl: blocked.positive,
+                    neutralUrl: blocked.neutral,
+                });
+            } catch (err) {
+                log.error(`${label}: could not start the browser fallback`, { error: (err as Error).message });
+            }
+        }
+        return samples;
+    }
+
+    /** Fetch a product's review samples, or `null` when the page links no review filter at all. */
+    function startItemReviews(
+        recordId: string,
+        page: Page,
+        urls: FeedbackUrls,
+        log: Log,
+    ): Promise<Partial<Record<FeedbackType, ReviewSample[]>>> | null {
+        if (!urls.negative && !urls.positive && !urls.neutral) return null;
+        log.info(`ITEM feedbackUrls: negative=${urls.negative} | positive=${urls.positive} | neutral=${urls.neutral}`);
+        return fetchReviewSamples(recordId, page, urls, readItemReviewSamples, 'ITEM_REVIEWS', 'ITEM_REVIEWS', log);
+    }
+
+    // Start the seller branch off the profile link on the product page. If that link goes to an
+    // intermediate /sch/i.html hub, route through SELLER_HUB first to resolve the real seller URL
+    // from the DOM; otherwise go straight to SELLER_STORE.
+    async function startSellerBranch(recordId: string, record: ScrapedItem, log: Log) {
+        const sellerUrl = record.seller?.profileUrl;
         if (!sellerUrl) {
-            log.warning('No seller profileUrl found on product page, pushing product-only data');
+            log.warning('No seller profileUrl found on product page, record will carry product-only data');
             // The caller asked for seller data and is not getting any — say so on the record rather
             // than shipping a half-empty seller section that reads like a dead store.
-            markFailure(scrappedItem, 'SELLER_UNRESOLVED', 'Product page exposed no seller profile link');
-            await pushScrapedItem(scrappedItem, log);
+            markFailure(record, 'SELLER_UNRESOLVED', 'Product page exposed no seller profile link');
             return;
         }
         let isHub = false;
         try {
-            // `scrappedItem.url` is the page we actually landed on, so a relative seller href stays
-            // on the marketplace the item came from.
-            const parsed = new URL(sellerUrl, siteFor(scrappedItem.url).origin);
+            // A relative seller href stays on the marketplace the item came from.
+            const parsed = new URL(sellerUrl, siteFor(record.url).origin);
             // Hub patterns: /sch/i.html?_ssn=X  OR  /sch/{slug}/m.html
             isHub = /\/sch\/i\.html/i.test(parsed.pathname)
                 || /\/sch\/[^/]+\/m\.html/i.test(parsed.pathname);
         } catch (_) {}
 
         if (isHub) {
-            log.info(`chainToSeller: product links to search hub, routing via SELLER_HUB → ${sellerUrl}`);
-            await crawler.addRequests([{
-                url: sellerUrl,
-                label: "SELLER_HUB",
-                userData: { scrappedItem }
-            }]);
+            log.info(`startSellerBranch: product links to search hub, routing via SELLER_HUB → ${sellerUrl}`);
+            await startBranch(recordId, 'SELLER', 'SELLER_HUB', sellerUrl, {});
         } else {
             const baseUrl = storeBaseUrl(sellerUrl);
-            scrappedItem.seller!.profileUrl = baseUrl;
-            await crawler.addRequests([{
-                url: baseUrl,
-                label: "SELLER_STORE",
-                userData: { scrappedItem, sellerBaseUrl: baseUrl }
-            }]);
+            record.seller!.profileUrl = baseUrl;
+            await startBranch(recordId, 'SELLER', 'SELLER_STORE', baseUrl, { sellerBaseUrl: baseUrl });
         }
     }
 
@@ -1103,44 +1420,44 @@ void (async () => {
     //   /sch/{slug}/m.html?...          (seller's items listing)
     // Extract real seller URL from .str-seller-card if present, else from links
     // that point to /str/{slug} or /usr/{slug}, else construct from the path slug.
-    crawler.router.addHandler("SELLER_HUB", async ({ page, request, response, log }) => {
+    crawler.router.addHandler("SELLER_HUB", async ({ page, request, log }) => {
         const phase = makePhaseLogger(log, 'SELLER_HUB');
         phase('handler start');
 
-        const scrappedItem = (request.userData as RequestUserData).scrappedItem!;
+        // product_and_seller: ITEM already opened this. seller_only: first contact, so create it.
+        const recordId = recordIdOf(request);
+        records.open(recordId, 'SELLER', () => sellerSeed(recordId));
+        const scrappedItem = records.get(recordId);
+
+        const hubLinks = '.str-seller-card, a[href*="/str/"], a[href*="/usr/"]';
+        const hub = await loadPage(page, request.url, {
+            label: 'SELLER_HUB',
+            isReady: ($) => $(hubLinks).length > 0,
+            waitSelector: hubLinks,
+            waitMs: 20000,
+        }, log);
+        phase(hub.rendered ? 'hub rendered' : 'hub fetched as HTML');
 
         // A hub URL for a seller eBay has removed 404s just like the store page does.
-        const httpStatus = response?.status();
+        const httpStatus = hub.status;
         if (isGoneStatus(httpStatus)) {
             scrappedItem.seller!.isActive = false;
-            markFailure(scrappedItem, 'SELLER_NOT_FOUND', `eBay returned HTTP ${httpStatus} for seller hub ${request.url}`);
-            await pushScrapedItem(scrappedItem, log);
+            await records.fail(recordId, 'SELLER', 'SELLER_NOT_FOUND', `eBay returned HTTP ${httpStatus} for seller hub ${request.url}`, log);
             return;
         }
 
         try {
-            await page.waitForSelector('.str-seller-card, a[href*="/str/"], a[href*="/usr/"]', { timeout: 20000 }).catch(() => {
+            if (hub.$(hubLinks).length === 0) {
                 log.warning(`SELLER_HUB: no seller-card or store/user link found`, { url: request.url });
-            });
-            phase('seller card/link wait done');
-
-            const resolvedSellerUrl = await page.evaluate(() => {
-                const pick = (sel: string) => (document.querySelector(sel) as HTMLAnchorElement | null)?.href || null;
-                const fromCard = pick('.str-seller-card__store-name h1 a')
-                    || pick('a.str-profile-link')
-                    || pick('.str-seller-card__store-logo a');
-                if (fromCard) return fromCard;
-                // Fallback: first anchor on the page that points to a seller store/profile
-                const anchor = document.querySelector('a[href*="/str/"], a[href*="/usr/"]') as HTMLAnchorElement | null;
-                return anchor?.href || null;
-            });
+            }
+            const resolvedSellerUrl = readHubSellerUrl(hub.$, hub.url);
 
             let sellerUrl = resolvedSellerUrl;
 
             // Fallback #2: construct from the slug in the URL path (/sch/{slug}/m.html)
             if (!sellerUrl || /\/sch\/i\.html/i.test(sellerUrl) || /\/sch\/[^/]+\/m\.html/i.test(sellerUrl)) {
                 try {
-                    const hubSite = siteFor(page.url());
+                    const hubSite = siteFor(hub.url);
                     const parsed = new URL(request.url, hubSite.origin);
                     const pathMatch = parsed.pathname.match(/\/sch\/([^/]+)\/m\.html/i);
                     const slug = (pathMatch && pathMatch[1] !== 'i.html') ? pathMatch[1] : null;
@@ -1157,8 +1474,7 @@ void (async () => {
 
             if (!sellerUrl) {
                 log.warning(`SELLER_HUB: could not resolve real seller URL, pushing product-only data`, { url: request.url });
-                markFailure(scrappedItem, 'SELLER_UNRESOLVED', `Seller hub ${request.url} exposed no store/profile link`);
-                await pushScrapedItem(scrappedItem, log);
+                await records.fail(recordId, 'SELLER', 'SELLER_UNRESOLVED', `Seller hub ${request.url} exposed no store/profile link`, log);
                 return;
             }
 
@@ -1170,11 +1486,8 @@ void (async () => {
                 scrappedItem.seller!.ebayUsername = slugMatch[1];
             }
 
-            await crawler.addRequests([{
-                url: cleaned,
-                label: "SELLER_STORE",
-                userData: { scrappedItem, sellerBaseUrl: cleaned }
-            }]);
+            // Same SELLER branch, so it stays open: the store handler is the one that settles it.
+            await enqueueBranch(recordId, 'SELLER_STORE', cleaned, { sellerBaseUrl: cleaned });
             phase('SELLER_HUB handler done (enqueued SELLER_STORE)');
         } catch (err) {
             log.error(`SELLER_HUB failed`, { url: request.url, error: (err as Error).message });
@@ -1183,162 +1496,91 @@ void (async () => {
     });
 
     // ──────────────────── SELLER_STORE ────────────────────
-    crawler.router.addHandler("SELLER_STORE", async ({ page, request, response, parseWithCheerio, log }) => {
+    crawler.router.addHandler("SELLER_STORE", async ({ page, request, log }) => {
         const phase = makePhaseLogger(log, 'SELLER_STORE');
         phase('handler start');
 
         const userData = request.userData as RequestUserData;
-        const scrappedItem = userData.scrappedItem!;
+        // product_and_seller: ITEM already opened this. seller_only: first contact, so create it.
+        const recordId = recordIdOf(request);
+        records.open(recordId, 'SELLER', () => sellerSeed(recordId));
+        const scrappedItem = records.get(recordId);
         const seller = scrappedItem.seller!;
         const sellerBaseUrl = userData.sellerBaseUrl!;
-        const site = siteFor(page.url());
 
-        // Store removed from the platform — definitive, and worth catching before the 15s wait for
-        // items that will never load.
-        const httpStatus = response?.status();
-        if (isGoneStatus(httpStatus)) {
-            seller.isActive = false;
-            markFailure(scrappedItem, 'SELLER_NOT_FOUND', `eBay returned HTTP ${httpStatus} for ${request.url}`);
-            await pushScrapedItem(scrappedItem, log);
-            return;
-        }
+        // Nothing on the shop, feedback or about tab depends on another, so all three start at once
+        // (through the residential proxy each is a 4-8s request; one after another they were most
+        // of the seller branch). The shop tab is still checked first below — a gone or walled
+        // store discards whatever the tabs brought back.
+        const storeUrl = request.url;
+        const anchor = await anchorPageFor(page.context(), siteFor(storeUrl), log);
+        // The shop tab: listing cards, store card and stats are all server-rendered, so it is
+        // fetched as HTML like the other tabs; rendering it used to mean waiting the full 15s on
+        // every store that has no listing grid at all.
+        const shopPromise = loadPage(page, storeUrl, {
+            label: 'SELLER_STORE shop tab',
+            isReady: ($) => isSellerAlive($),
+            waitSelector: 'article.str-item-card',
+            waitMs: 15000,
+        }, log);
+        shopPromise.catch(() => {});
 
-        try {
-            await page.waitForSelector('article.str-item-card', { timeout: 15000 }).catch(() => {
-                log.warning(`SELLER_STORE: No store items found on Shop tab`, { url: request.url });
-            });
-            phase('store items DOM ready');
+        // Each tab is fetched as HTML through the session; only a tab eBay will not serve that way
+        // gets rendered, on a page of its own, once we know where the shop tab landed.
+        const tabPages: Page[] = [];
+        const loadTab = async (tab: 'feedback' | 'about', readySelector: string, required: boolean) => {
+            const target = new URL(storeUrl);
+            target.searchParams.set('_tab', tab);
+            const fetched = anchor ? await fetchHtml(
+                anchor, target.toString(),
+                // A redirect that drops `_tab` lands on the shop tab instead — not this tab. A store
+                // with no about section is a normal answer, not a reason to render.
+                ($, finalUrl) => new URL(finalUrl).searchParams.get('_tab') === tab && (!required || $(readySelector).length > 0),
+                log, `SELLER_STORE ${tab} tab`,
+            ) : null;
+            if (fetched) return fetched;
 
-            // Same three-way split as the item page: no eBay chrome means we were walled and should
-            // retry; chrome but none of the store markup means the store itself is gone.
-            const $store = await parseWithCheerio();
-            if (isWalled($store)) {
-                throw blockedError(httpStatus, false);
+            const shop = await shopPromise;
+            // The store URL redirected (a /usr/ profile to its /str/ store) and the redirect dropped
+            // `_tab` — ask for the tab where the shop tab actually landed before rendering it.
+            if (anchor && new URL(shop.url).pathname !== new URL(storeUrl).pathname) {
+                const landedTab = new URL(shop.url);
+                landedTab.searchParams.set('_tab', tab);
+                const again = await fetchHtml(
+                    anchor, landedTab.toString(),
+                    ($, finalUrl) => new URL(finalUrl).searchParams.get('_tab') === tab && (!required || $(readySelector).length > 0),
+                    log, `SELLER_STORE ${tab} tab (after redirect)`,
+                );
+                if (again) return again;
             }
-            if (!isSellerAlive($store)) {
-                seller.isActive = false;
-                markFailure(scrappedItem, 'SELLER_NOT_FOUND', `${request.url} rendered none of the store/profile markup`);
-                await pushScrapedItem(scrappedItem, log);
-                return;
-            }
-            seller.isActive = true;
+            const tabPage = await page.context().newPage();
+            tabPages.push(tabPage);
+            const ready = await openStoreTab(tabPage, shop.url, tab, readySelector, log);
+            // Some layouts already render the block on the shop tab.
+            if (!ready && shop.$(readySelector).length > 0) return { $: shop.$, url: shop.url };
+            if (!ready) log.warning(`SELLER_STORE: ${tab} content never rendered`, { url: request.url });
+            return { $: cheerio.load(await tabPage.content()), url: tabPage.url() };
+        };
 
-            const rawItems = await page.evaluate(() => {
-                const items: { name: string | null; imageUrl: string | null; priceText: string | null; url: string | null }[] = [];
-                document.querySelectorAll('article.str-item-card').forEach((el) => {
-                    if (items.length >= 10) return;
-                    const name = el.querySelector('.str-item-card__property-title .str-text-span')?.textContent?.trim() || null;
-                    const imageUrl = (el.querySelector('img[data-testid="str-img"]') as HTMLImageElement | null)?.src || null;
-                    const priceText = el.querySelector('.str-item-card__property-displayPrice')?.textContent?.trim() || null;
-                    const itemUrl = (el.querySelector('a.str-item-card__link') as HTMLAnchorElement | null)?.href || null;
-                    if (name) items.push({ name, imageUrl, priceText, url: itemUrl });
-                });
-                return items;
-            });
-            seller.storeItems = rawItems.map(item => {
-                let priceMin: number | null = null, priceMax: number | null = null, currency: string | null = null;
-                if (item.priceText) {
-                    const parts = item.priceText.split(/\s+to\s+/i);
-                    const fromParsed = parseCurrency(parts[0]?.trim(), site.currency);
-                    if (fromParsed) { priceMin = fromParsed.cost; currency = fromParsed.currency; }
-                    if (parts.length > 1) {
-                        const toParsed = parseCurrency(parts[1]?.trim(), site.currency);
-                        if (toParsed) priceMax = toParsed.cost;
-                    }
-                }
-                return { name: item.name, imageUrl: item.imageUrl, currency, priceMin, priceMax, url: item.url };
-            });
-            log.info(`Scraped ${seller.storeItems.length} store items`);
-            phase('store items extracted');
+        // The review samples only need the seller's username. A /str/ store's feedback tab always
+        // links them in one shape (identical on bose, amazing-wireless, ecoflowsolar and an ebay.es
+        // store), so with the username the product page gave us they start now instead of after
+        // the feedback tab. A /usr/ profile links a different shape, and a seller_only seed only
+        // knows the URL slug (`amazingwireless` for user `amazing-wireless`) — those wait for the
+        // tab's own links.
+        const knownUsername = scrappedItem.sellerRef?.ebayUsername;
+        const earlyReviews = anchor && knownUsername && /\/str\//i.test(new URL(storeUrl).pathname)
+            ? fetchReviewSamples(
+                recordId, anchor, buildSellerFeedbackUrls(siteFor(storeUrl).origin, knownUsername),
+                readSellerReviewSamples, 'SELLER_REVIEWS', 'SELLER_REVIEWS', log,
+            ).then((samples) => { phase('seller reviews fetched (from username)'); return samples; })
+            : null;
 
-            if (!await openStoreTab(page, 'feedback', '.rating-element', log)) {
-                log.warning(`SELLER_STORE: Feedback content never rendered`, { url: request.url });
-            }
+        const feedbackDone = (async () => {
+            const feedbackTab = await loadTab('feedback', '.rating-element', true);
             phase('feedback tab loaded');
 
-            const raw = await page.evaluate(() => {
-                // Every number and label on this page is localized — `2 329` on ebay.es, `2,329` on
-                // ebay.com, "Positivos" vs "Positive". So the browser only reads text out of the
-                // DOM; interpreting it is Node's job, where the locale-tolerant parsers live.
-                const ratingElements = [...document.querySelectorAll('.rating-element')].map(el => {
-                    const anchor = el.querySelector('a');
-                    return {
-                        // The href carries `commentType=POSITIVE`, which is identical on every
-                        // marketplace — unlike the label beside it, which is the seller's language.
-                        href: anchor?.href || null,
-                        label: el.querySelector(':scope > span')?.textContent?.trim() || null,
-                        countText: el.querySelector('.INLINE_LINK')?.textContent?.trim() || null,
-                    };
-                });
-
-                const detailedRatingRows = [...document.querySelectorAll('.fdbk-detail-seller-rating')].map(el => ({
-                    label: el.querySelector('.fdbk-detail-seller-rating__label span')?.textContent?.trim() || null,
-                    // The value cell holds two spans: the visible `4.9` and a screen-reader-only
-                    // `.fb-clipped` "4.9 out of 5 stars". Taking the cell's whole textContent glues
-                    // them into `4.94.9 out of 5 stars`, which parses as 4949 — so read the visible
-                    // span only.
-                    valueText: el.querySelector('.fdbk-detail-seller-rating__value span:not(.fb-clipped)')?.textContent?.trim() || null,
-                    // Same number as a plain, locale-independent attribute; used when the markup
-                    // changes and the span above stops matching.
-                    progressValue: el.querySelector('progress')?.getAttribute('value') || null,
-                }));
-
-                const storeStats = [...document.querySelectorAll('.str-seller-card__store-stats-content > div')].map(div => ({
-                    text: div.textContent?.trim() || '',
-                    boldText: div.querySelector('.BOLD')?.textContent?.trim() || '',
-                    // The percentage is the only stat wrapped in the feedback link — a structural
-                    // marker, so it survives translation.
-                    isFeedbackLink: !!div.querySelector('a.str-seller-card__feedback-link'),
-                }));
-
-                const feedbackCountText = document.querySelector('.fdbk-detail-list__title .SECONDARY')?.textContent || '';
-                const altPercentText = document.querySelector('.fdbk-overall-rating__bar-text')?.textContent?.trim()
-                    || document.querySelector('.fdbk-overall-rating .SECONDARY')?.textContent?.trim()
-                    || document.querySelector('[class*="positive-feedback"]')?.textContent?.trim()
-                    || '';
-
-                let ebayUsername = null;
-                const scripts = document.querySelectorAll('script');
-                for (const s of scripts) {
-                    const txt = s.textContent || '';
-                    const entityMatch = txt.match(/"entity_id"\s*:\s*"~([^"]+)"/);
-                    if (entityMatch) { ebayUsername = entityMatch[1]; break; }
-                }
-                if (!ebayUsername) {
-                    const fdbkLink = document.querySelector('a[href*="fdbk/feedback_profile/"]') as HTMLAnchorElement | null;
-                    if (fdbkLink) {
-                        const hrefMatch = fdbkLink.href.match(/\/fdbk\/feedback_profile\/([^/?]+)/);
-                        if (hrefMatch) ebayUsername = decodeURIComponent(hrefMatch[1]);
-                    }
-                }
-                if (!ebayUsername) {
-                    ebayUsername = document.querySelector('.fdbk-detail-list__title .PSEUDOLINK')?.textContent?.trim() || null;
-                }
-
-                const displayName = document.querySelector('.str-seller-card__store-name h1 a')?.textContent?.trim()
-                    || document.querySelector('.str-seller-card__store-name h1')?.textContent?.trim()
-                    || document.querySelector('.x-sellercard-atf__info__about-seller a .ux-textspans--BOLD')?.textContent?.trim()
-                    || (document.querySelector('img.str-header__logo--img') as HTMLImageElement | null)?.alt?.trim()
-                    || (() => {
-                        const t = document.title || '';
-                        const m = t.match(/^(.+?)\s*[|–—]/);
-                        return m ? m[1].trim() : null;
-                    })()
-                    || null;
-
-                let storeId = null;
-                const trackEl = document.querySelector('[data-track*="soid"]');
-                if (trackEl) {
-                    try {
-                        const trackData = JSON.parse(trackEl.getAttribute('data-track') || '{}');
-                        storeId = trackData?.eventProperty?.['ads-soid'] || trackData?.eventProperty?.soid || null;
-                    } catch (e) { /* ignore malformed data-track */ }
-                }
-
-                const logoUrl = (document.querySelector('img.str-header__logo--img') as HTMLImageElement | null)?.src || null;
-
-                return { ratingElements, detailedRatingRows, storeStats, feedbackCountText, altPercentText, displayName, ebayUsername, storeId, logoUrl };
-            });
+            const raw = readStoreFeedback(feedbackTab.$, feedbackTab.url);
 
             // ── Interpret the raw text, marketplace by marketplace ──
             const warnCount = (label: string, parsed: ReturnType<typeof parseCount>) => {
@@ -1473,21 +1715,103 @@ void (async () => {
             //     return { scriptBlocks: scriptBlocks.length, jsonState, dataAttributes, trackingIds: { googleAnalytics, facebookPixel }, jsBundles, cssBundles };
             // });
             // scrappedItem.sellerTechnical = sellerTechnical;
+
             phase('seller data extracted');
 
-            // Same locale trap as the feedback tab — "about" is "Información" on ebay.es.
-            await openStoreTab(page, 'about', '.str-about-description, .str-business-details', log);
-            const aboutData = await page.evaluate(() => {
-                const readRows = (selector: string) => [...document.querySelectorAll(selector)].map(el => ({
-                    label: el.querySelector('.SECONDARY')?.textContent?.trim() || '',
-                    value: el.querySelector('.BOLD')?.textContent?.trim() || '',
-                }));
-                return {
-                    aboutDescription: document.querySelector('.str-about-description__description .str-text-span')?.textContent?.trim() || null,
-                    sellerInfoRows: readRows('.str-about-description__seller-info > span'),
-                    businessDetailRows: readRows('.str-business-details__seller-info > span'),
-                };
+            // The review samples need nothing else from this store, so they start right away,
+            // concurrently with the about tab and the shop items — unless they already started
+            // off the username above.
+            if (earlyReviews) {
+                const samples = await earlyReviews;
+                if (samples.negative) seller.feedback.negativeReviewSamples = samples.negative;
+                if (samples.positive) seller.feedback.positiveReviewSamples = samples.positive;
+                if (samples.neutral) seller.feedback.neutralReviewSamples = samples.neutral;
+            } else if (feedbackLinks.negative || feedbackLinks.positive || feedbackLinks.neutral) {
+                const samples = await fetchReviewSamples(
+                    recordId, anchor ?? (await shopPromise).htmlPage, feedbackLinks, readSellerReviewSamples, 'SELLER_REVIEWS', 'SELLER_REVIEWS', log,
+                );
+                if (samples.negative) seller.feedback.negativeReviewSamples = samples.negative;
+                if (samples.positive) seller.feedback.positiveReviewSamples = samples.positive;
+                if (samples.neutral) seller.feedback.neutralReviewSamples = samples.neutral;
+                phase('seller reviews fetched');
+            } else {
+                log.warning('No seller feedback link found, skipping seller reviews');
+            }
+            return { resolvedUsername };
+        })();
+
+        // Same locale trap as the feedback tab — "about" is "Información" on ebay.es.
+        const aboutRaw = (async () => {
+            const aboutTab = await loadTab('about', '.str-about-description, .str-business-details', false);
+            return readStoreAbout(aboutTab.$);
+        })();
+
+        // Awaited below on the happy path; until then, keep a failure from being reported as an
+        // unhandled rejection.
+        feedbackDone.catch(() => {});
+        aboutRaw.catch(() => {});
+
+        // Closes any fallback tab pages — so an early exit does not sit out their load timeouts —
+        // then waits for the tab tasks to wind down: anything a task does (starting the
+        // SELLER_REVIEWS fallback) must land before the SELLER branch settles. Safe to call twice.
+        const closeTabs = async () => {
+            const settled = Promise.allSettled([feedbackDone, aboutRaw, earlyReviews]);
+            for (const p of tabPages) await p.close().catch(() => {});
+            await settled;
+            // A fallback page opened after the first pass above.
+            for (const p of tabPages) await p.close().catch(() => {});
+        };
+
+        try {
+            const shop = await shopPromise;
+            const $store = shop.$;
+            const landedUrl = shop.url;
+            const site = siteFor(landedUrl);
+            phase(shop.rendered ? 'shop tab rendered' : 'shop tab fetched as HTML');
+
+            // Store removed from the platform — definitive.
+            const httpStatus = shop.status;
+            if (isGoneStatus(httpStatus)) {
+                seller.isActive = false;
+                await closeTabs();
+                await records.fail(recordId, 'SELLER', 'SELLER_NOT_FOUND', `eBay returned HTTP ${httpStatus} for ${request.url}`, log);
+                return;
+            }
+            // Same three-way split as the item page: no eBay chrome means we were walled and should
+            // retry; chrome but none of the store markup means the store itself is gone.
+            if (isWalled($store)) {
+                throw blockedError(httpStatus, false);
+            }
+            if (!isSellerAlive($store)) {
+                seller.isActive = false;
+                await closeTabs();
+                await records.fail(recordId, 'SELLER', 'SELLER_NOT_FOUND', `${request.url} rendered none of the store/profile markup`, log);
+                return;
+            }
+            seller.isActive = true;
+
+            const rawItems = readStoreItems($store, landedUrl);
+            if (rawItems.length === 0) {
+                log.warning(`SELLER_STORE: No store items found on Shop tab`, { url: request.url });
+            }
+            seller.storeItems = rawItems.map(item => {
+                let priceMin: number | null = null, priceMax: number | null = null, currency: string | null = null;
+                if (item.priceText) {
+                    const parts = item.priceText.split(/\s+to\s+/i);
+                    const fromParsed = parseCurrency(parts[0]?.trim(), site.currency);
+                    if (fromParsed) { priceMin = fromParsed.cost; currency = fromParsed.currency; }
+                    if (parts.length > 1) {
+                        const toParsed = parseCurrency(parts[1]?.trim(), site.currency);
+                        if (toParsed) priceMax = toParsed.cost;
+                    }
+                }
+                return { name: item.name, imageUrl: item.imageUrl, currency, priceMin, priceMax, url: item.url };
             });
+            log.info(`Scraped ${seller.storeItems.length} store items`);
+            phase('store items extracted');
+
+            const { resolvedUsername } = await feedbackDone;
+            const aboutData = await aboutRaw;
 
             // These labels are translated too — ebay.es renders "Ubicación:", "Usuario desde:",
             // "Vendedor:". Matching them by English text left `memberSince` null on every
@@ -1525,26 +1849,14 @@ void (async () => {
             };
             phase('about tab extracted');
 
-            if (feedbackLinks.negative || feedbackLinks.positive || feedbackLinks.neutral) {
-                const primary = feedbackLinks.negative || feedbackLinks.positive || feedbackLinks.neutral;
-                await crawler.addRequests([{
-                    url: primary!,
-                    label: "SELLER_REVIEWS",
-                    userData: {
-                        scrappedItem,
-                        negativeUrl: feedbackLinks.negative || null,
-                        positiveUrl: feedbackLinks.positive || null,
-                        neutralUrl: feedbackLinks.neutral || null,
-                    }
-                }]);
-            } else {
-                log.warning('No seller feedback link found, pushing data');
-                await pushScrapedItem(scrappedItem, log);
-            }
+            await closeTabs();
+            await records.settle(recordId, 'SELLER', log);
             phase('SELLER_STORE handler done');
         } catch (err) {
             log.error(`SELLER_STORE failed`, { url: request.url, error: (err as Error).message });
             throw err;
+        } finally {
+            await closeTabs();
         }
     });
 
@@ -1556,8 +1868,8 @@ void (async () => {
         phase('handler start');
 
         const userData = request.userData as RequestUserData;
-        const scrappedItem = userData.scrappedItem!;
-        const seller = scrappedItem.seller!;
+        const recordId = recordIdOf(request);
+        const seller = records.get(recordId).seller!;
         const { negativeUrl, positiveUrl, neutralUrl } = userData;
 
         const scrapeSamples = async (p: Page, label: string) => {
@@ -1663,13 +1975,14 @@ void (async () => {
             await Promise.all(tasks);
             phase('parallel review pages scraped');
 
-            seller.feedback.negativeReviewSamples = samplesByType.negative;
-            seller.feedback.positiveReviewSamples = samplesByType.positive;
-            seller.feedback.neutralReviewSamples = samplesByType.neutral;
+            // Only the types this fallback was handed — the others were already fetched as HTML.
+            if (negativeUrl) seller.feedback.negativeReviewSamples = samplesByType.negative;
+            if (positiveUrl) seller.feedback.positiveReviewSamples = samplesByType.positive;
+            if (neutralUrl) seller.feedback.neutralReviewSamples = samplesByType.neutral;
             log.info(`SELLER_REVIEWS: negative=${samplesByType.negative.length}, positive=${samplesByType.positive.length}, neutral=${samplesByType.neutral.length}`);
 
-            await pushScrapedItem(scrappedItem, log);
-            phase('SELLER_REVIEWS handler done (data pushed)');
+            await records.settle(recordId, 'SELLER_REVIEWS', log);
+            phase('SELLER_REVIEWS handler done');
         } finally {
             for (const p of secondaryPages) await p.close().catch(() => {});
         }
