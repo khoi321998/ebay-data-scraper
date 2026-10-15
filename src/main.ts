@@ -30,7 +30,6 @@ import { Actor, log as runLog } from 'apify';
 import * as cheerio from "cheerio";
 import { Dataset, type Log, PlaywrightCrawler, ProxyConfiguration } from "crawlee";
 import fsSync from "fs";
-import fs from "fs/promises";
 import got from "got";
 import countries from "i18n-iso-countries";
 import type { BrowserContext, Page, Request as PlaywrightRequest } from "playwright";
@@ -864,11 +863,11 @@ void (async () => {
         }
 
         // Same for the reviews, when their filter links are already in the server-rendered DOM;
-        // otherwise they are looked for again once the feedback widget has had a chance to load.
+        // otherwise their links are built below. A rendered page is not scrolled or waited on for
+        // the feedback widget: the server HTML already carries the rating histogram (the HTML
+        // path proves it), and waiting cost up to 3s per captcha-fallback item.
         let reviewsTask = startItemReviews(recordId, htmlPage, productFeedbackUrls($, landedUrl), log);
         if (reviewsTask) phase('item reviews fetch started');
-
-        await fs.writeFile('scriptContent.js', scriptContent).catch(err => console.error('Error logging script:', err));
 
         const rawPriceTexts: string[] = [];
         $('div.x-price-primary span.ux-textspans').each((_i, el) => {
@@ -962,21 +961,6 @@ void (async () => {
 
         phase('cheerio metadata extracted');
 
-        if (rendered) {
-            await page.evaluate(() => {
-                const el = document.querySelector('.x-feedback-detail-list, .ux-summary__start--rating, [class*="reviews"]');
-                if (el) el.scrollIntoView();
-            });
-            // Reduced from 8s to 3s. Widget often lazy-loads beyond 3s but rating
-            // data is non-critical and items without reviews never render the widget anyway.
-            await page.waitForSelector('span.ux-summary__start--rating, div.ux-histogram__item--bar', { timeout: 3000 }).catch(() => {});
-            $ = cheerio.load(await page.content());
-            phase('rating section ready (scroll+wait)');
-            if (!reviewsTask) {
-                reviewsTask = startItemReviews(recordId, htmlPage, productFeedbackUrls($, landedUrl), log);
-                if (reviewsTask) phase('item reviews fetch started (after feedback widget load)');
-            }
-        }
         if (!reviewsTask && platformItemId && ebayUsername && $('.x-feedback-detail-list').length > 0) {
             // The feedback module is there but lazy — eBay fills it with the seller's "All items"
             // filters after render. Build those links instead of rendering for them.
@@ -1316,6 +1300,11 @@ void (async () => {
             skipNavigation: label === 'SELLER_HUB' || label === 'SELLER_STORE',
             userData: { ...userData, recordId },
         }], { forefront: true });
+        // The pool's 0.5s "anything new in the queue?" poll is stuck while a task runs: the
+        // @apify/utilities 2.29 betterSetInterval only reschedules once the previous call settles,
+        // and that call awaits the task it started. Without this nudge the branch sat in the queue
+        // until the parent ITEM finished (~2s on every product_and_seller record).
+        void crawler.autoscaledPool?.notify();
     }
 
     /** Open `branch` on the record and enqueue its first request — once per record, however often called. */
