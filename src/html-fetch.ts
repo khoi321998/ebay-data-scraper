@@ -50,44 +50,51 @@ async function rawFetch(page: Page, url: string): Promise<RawResponse> {
 }
 
 /**
- * Fetch `url` through `page`'s session and parse it, or `null` when the page did not give us what
- * we came for — an error status, the captcha, the bot wall, or no sign of the expected content
- * (`isReady`). `null` is the caller's cue for its fallback (usually rendering the page), which the
- * caller logs itself.
+ * What `fetchHtml` got. A miss is `blocked` when it says the session's IP is walled or too slow to
+ * use — the captcha, 403/429, a page without eBay chrome, or a fetch that failed or timed out.
+ * Rendering on the same IP does not get past those (every rendered retry of a captcha'd fetch
+ * landed on the challenge page too, 2026-10-15), so the caller should rotate the session instead.
+ * Any other miss — another error status, or no sign of the expected content (`isReady`) — is the
+ * caller's cue for its fallback (usually rendering the page), which the caller logs itself.
  */
+export type HtmlFetch =
+    | { ok: true; $: CheerioAPI; url: string }
+    | { ok: false; blocked: boolean };
+
+/** Fetch `url` through `page`'s session and parse it. */
 export async function fetchHtml(
     page: Page,
     url: string,
     isReady: ($: CheerioAPI, finalUrl: string) => boolean,
     log: Log,
     label: string,
-): Promise<{ $: CheerioAPI; url: string } | null> {
+): Promise<HtmlFetch> {
     const t0 = Date.now();
     let res: RawResponse;
     try {
         res = await rawFetch(page, url);
     } catch (err) {
         log.warning(`${label}: HTML fetch failed — not using it`, { url, error: (err as Error).message });
-        return null;
+        return { ok: false, blocked: true };
     }
     const ms = Date.now() - t0;
     if (isCaptchaUrl(res.url)) {
         log.warning(`${label}: HTML fetch hit the captcha — not using it`, { url, ms });
-        return null;
+        return { ok: false, blocked: true };
     }
     if (res.status >= 400) {
         log.warning(`${label}: HTML fetch got HTTP ${res.status} — not using it`, { url, ms });
-        return null;
+        return { ok: false, blocked: res.status === 403 || res.status === 429 };
     }
     const $ = cheerio.load(res.html);
     if (isWalled($)) {
         log.warning(`${label}: HTML fetch got a page without eBay chrome — not using it`, { url, ms });
-        return null;
+        return { ok: false, blocked: true };
     }
     if (!isReady($, res.url)) {
         log.warning(`${label}: HTML fetch lacks the expected content — not using it`, { url, ms });
-        return null;
+        return { ok: false, blocked: false };
     }
     log.info(`${label}: fetched as HTML in ${ms}ms (${Math.round(res.html.length / 1024)} KB)`, { url });
-    return { $, url: res.url };
+    return { ok: true, $, url: res.url };
 }

@@ -28,7 +28,7 @@ import 'dotenv/config';
 
 import { Actor, log as runLog } from 'apify';
 import * as cheerio from "cheerio";
-import { Dataset, type Log, PlaywrightCrawler, ProxyConfiguration } from "crawlee";
+import { Dataset, type Log, PlaywrightCrawler, ProxyConfiguration, type Session } from "crawlee";
 import fsSync from "fs";
 import got from "got";
 import countries from "i18n-iso-countries";
@@ -428,7 +428,9 @@ async function loadPage(
     const site = siteFor(url);
     const anchor = await anchorPageFor(page.context(), site, log);
     const fetched = anchor ? await fetchHtml(anchor, url, opts.isReady, log, opts.label) : null;
-    if (fetched) return { $: fetched.$, url: fetched.url, status: 200, htmlPage: anchor!, rendered: false };
+    if (fetched?.ok) return { $: fetched.$, url: fetched.url, status: 200, htmlPage: anchor!, rendered: false };
+    // Walled or too slow on this IP: rendering here only lands on the same wall, slower.
+    if (fetched?.blocked) throw blockedError(undefined, true);
 
     log.info(`${opts.label}: rendering in the browser`, { url });
     const t0 = Date.now();
@@ -610,6 +612,9 @@ void (async () => {
             maxOpenPagesPerBrowser: PAGES_PER_BROWSER,
         },
         maxRequestRetries: 5,
+        // A blockedError (SessionError) retry is counted against this, not maxRequestRetries —
+        // keep it to the same budget so a walled URL does not walk through ten IPs.
+        maxSessionRotations: 5,
         useSessionPool: true,
         sessionPoolOptions: { maxPoolSize: 20 },
         // eBay constantly swaps ad/payment iframes; walking them in parseWithCheerio
@@ -634,6 +639,9 @@ void (async () => {
         postNavigationHooks: [
             async ({ page, request, response, log }) => {
                 const status = response?.status();
+                // The challenge page answers 200: without this the review fallbacks sat out their
+                // 20-40s content wait on it and shipped empty samples as a success (2026-10-15).
+                if (isCaptchaUrl(page.url())) throw blockedError(status, true);
                 if (!status || status < 400) return;
                 // 404/410 is eBay's normal answer for a removed listing/store, not an anti-bot
                 // problem — the handlers turn it into a NOT_FOUND record, so no forensics needed.
@@ -663,6 +671,12 @@ void (async () => {
         // could not tell "eBay blocked us" from "we never got asked to scrape it". Settle the branch
         // with the reason, so the record still ships with whatever the other branches assembled —
         // or, when no handler ever got to start one, push an empty record of the right shape.
+        // A navigation that times out or is aborted means a slow or dead proxy IP (2026-10-15: one IP
+        // took 8s for robots.txt and 16s for the item, then every review page timed out). Crawlee
+        // only marks such a session bad, so the retry took the same browser again — retire it.
+        errorHandler: async ({ session }, error) => {
+            if (/Timeout d+ms exceeded|net::ERR_/.test(error.message)) session?.retire();
+        },
         failedRequestHandler: async ({ request, log }, error) => {
             const message = error?.message || 'Unknown error';
             log.error(`Request failed: ${request.url}`, {
@@ -689,7 +703,7 @@ void (async () => {
     });
 
     // ──────────────────── ITEM ────────────────────
-    crawler.router.addHandler("ITEM", async ({ page, request, log }) => {
+    crawler.router.addHandler("ITEM", async ({ page, request, log, session }) => {
         const phase = makePhaseLogger(log, 'ITEM');
         phase('handler start');
 
@@ -784,8 +798,8 @@ void (async () => {
         if (incomplete) {
             log.info(`ITEM: ${incomplete}, fetching once more`, { url: request.url });
             const again = await fetchHtml(htmlPage, request.url, ($doc) => isItemPage($doc) && !itemPageGap($doc, needSeller), log, 'ITEM (refetch)');
-            if (again) $ = again.$;
-            phase(again ? 'item re-fetched complete' : `item still incomplete (${incomplete}), using the first copy`);
+            if (again.ok) $ = again.$;
+            phase(again.ok ? 'item re-fetched complete' : `item still incomplete (${incomplete}), using the first copy`);
         }
 
         // Re-resolve after navigation: the smaller marketplaces redirect to a bigger one, and from
@@ -866,7 +880,7 @@ void (async () => {
         // otherwise their links are built below. A rendered page is not scrolled or waited on for
         // the feedback widget: the server HTML already carries the rating histogram (the HTML
         // path proves it), and waiting cost up to 3s per captcha-fallback item.
-        let reviewsTask = startItemReviews(recordId, htmlPage, productFeedbackUrls($, landedUrl), log);
+        let reviewsTask = startItemReviews(recordId, htmlPage, productFeedbackUrls($, landedUrl), log, session);
         if (reviewsTask) phase('item reviews fetch started');
 
         const rawPriceTexts: string[] = [];
@@ -965,7 +979,7 @@ void (async () => {
             // The feedback module is there but lazy — eBay fills it with the seller's "All items"
             // filters after render. Build those links instead of rendering for them.
             log.info('ITEM: feedback module is lazy-loaded, building its filter links');
-            reviewsTask = startItemReviews(recordId, htmlPage, buildAllItemsFeedbackUrls(site.origin, platformItemId, ebayUsername), log);
+            reviewsTask = startItemReviews(recordId, htmlPage, buildAllItemsFeedbackUrls(site.origin, platformItemId, ebayUsername), log, session);
             if (reviewsTask) phase('item reviews fetch started (built links)');
         }
         if (!reviewsTask) log.warning('No product feedback URL found, skipping product reviews');
@@ -1251,6 +1265,9 @@ void (async () => {
         };
 
         const secondaryPages: Page[] = [];
+        // A secondary page that lands on the challenge fails the whole request, so it is retried
+        // on a fresh session rather than recorded with no samples.
+        const wall = { hit: false };
         try {
             const tasks: Promise<void>[] = [
                 scrapeSamples(page, `ITEM_${primaryType.toUpperCase()}_REVIEWS`).then(r => { samplesByType[primaryType] = r; })
@@ -1262,13 +1279,17 @@ void (async () => {
                 const label = `ITEM_${t.type.toUpperCase()}_REVIEWS`;
                 tasks.push(
                     secondaryPage.goto(t.url, { waitUntil: 'domcontentloaded', timeout: 30000 })
-                        .then(async () => { samplesByType[t.type] = await scrapeSamples(secondaryPage, label); })
+                        .then(async () => {
+                            if (isCaptchaUrl(secondaryPage.url())) { wall.hit = true; return; }
+                            samplesByType[t.type] = await scrapeSamples(secondaryPage, label);
+                        })
                         .catch((err: unknown) => {
                             log.error(`${label} navigation failed`, { url: t.url, error: (err as Error).message });
                         })
                 );
             }
             await Promise.all(tasks);
+            if (wall.hit) throw blockedError(undefined, true);
             phase('parallel review pages scraped');
 
             // Looked up only now: ITEM swaps in the full product object when it finishes, and that
@@ -1332,16 +1353,24 @@ void (async () => {
         branch: Branch,
         label: string,
         log: Log,
+        session: Session | undefined,
     ): Promise<Partial<Record<FeedbackType, ReviewSample[]>>> {
         const samples: Partial<Record<FeedbackType, ReviewSample[]>> = {};
         const blocked: FeedbackUrls = { negative: null, positive: null, neutral: null };
+        let walled = false;
         await Promise.all(FEEDBACK_TYPES.map(async (type) => {
             const url = urls[type];
             if (!url) return;
             const fetched = await fetchHtml(page, url, hasReviewContent, log, `${label}_${type.toUpperCase()}`);
-            if (fetched) samples[type] = read(fetched.$);
-            else blocked[type] = url;
+            if (fetched.ok) samples[type] = read(fetched.$);
+            else {
+                blocked[type] = url;
+                if (fetched.blocked) walled = true;
+            }
         }));
+        // The fallback below would otherwise take a free page on this same browser — same IP, same
+        // wall. Retiring the session sends it to a fresh browser; the pages still open here finish.
+        if (walled) session?.retire();
 
         // Primary URL drives Crawlee navigation; the others are opened on secondary pages inside
         // the fallback handler so all scrape concurrently there too.
@@ -1366,10 +1395,11 @@ void (async () => {
         page: Page,
         urls: FeedbackUrls,
         log: Log,
+        session: Session | undefined,
     ): Promise<Partial<Record<FeedbackType, ReviewSample[]>>> | null {
         if (!urls.negative && !urls.positive && !urls.neutral) return null;
         log.info(`ITEM feedbackUrls: negative=${urls.negative} | positive=${urls.positive} | neutral=${urls.neutral}`);
-        return fetchReviewSamples(recordId, page, urls, readItemReviewSamples, 'ITEM_REVIEWS', 'ITEM_REVIEWS', log);
+        return fetchReviewSamples(recordId, page, urls, readItemReviewSamples, 'ITEM_REVIEWS', 'ITEM_REVIEWS', log, session);
     }
 
     // Start the seller branch off the profile link on the product page. If that link goes to an
@@ -1485,7 +1515,7 @@ void (async () => {
     });
 
     // ──────────────────── SELLER_STORE ────────────────────
-    crawler.router.addHandler("SELLER_STORE", async ({ page, request, log }) => {
+    crawler.router.addHandler("SELLER_STORE", async ({ page, request, log, session }) => {
         const phase = makePhaseLogger(log, 'SELLER_STORE');
         phase('handler start');
 
@@ -1527,7 +1557,9 @@ void (async () => {
                 ($, finalUrl) => new URL(finalUrl).searchParams.get('_tab') === tab && (!required || $(readySelector).length > 0),
                 log, `SELLER_STORE ${tab} tab`,
             ) : null;
-            if (fetched) return fetched;
+            if (fetched?.ok) return { $: fetched.$, url: fetched.url };
+            // Same IP as the shop tab: rendering this tab would only meet the same wall.
+            if (fetched?.blocked) throw blockedError(undefined, true);
 
             const shop = await shopPromise;
             // The store URL redirected (a /usr/ profile to its /str/ store) and the redirect dropped
@@ -1540,7 +1572,8 @@ void (async () => {
                     ($, finalUrl) => new URL(finalUrl).searchParams.get('_tab') === tab && (!required || $(readySelector).length > 0),
                     log, `SELLER_STORE ${tab} tab (after redirect)`,
                 );
-                if (again) return again;
+                if (again.ok) return { $: again.$, url: again.url };
+                if (again.blocked) throw blockedError(undefined, true);
             }
             const tabPage = await page.context().newPage();
             tabPages.push(tabPage);
@@ -1561,7 +1594,7 @@ void (async () => {
         const earlyReviews = anchor && knownUsername && /\/str\//i.test(new URL(storeUrl).pathname)
             ? fetchReviewSamples(
                 recordId, anchor, buildSellerFeedbackUrls(siteFor(storeUrl).origin, knownUsername),
-                readSellerReviewSamples, 'SELLER_REVIEWS', 'SELLER_REVIEWS', log,
+                readSellerReviewSamples, 'SELLER_REVIEWS', 'SELLER_REVIEWS', log, session,
             ).then((samples) => { phase('seller reviews fetched (from username)'); return samples; })
             : null;
 
@@ -1717,7 +1750,7 @@ void (async () => {
                 if (samples.neutral) seller.feedback.neutralReviewSamples = samples.neutral;
             } else if (feedbackLinks.negative || feedbackLinks.positive || feedbackLinks.neutral) {
                 const samples = await fetchReviewSamples(
-                    recordId, anchor ?? (await shopPromise).htmlPage, feedbackLinks, readSellerReviewSamples, 'SELLER_REVIEWS', 'SELLER_REVIEWS', log,
+                    recordId, anchor ?? (await shopPromise).htmlPage, feedbackLinks, readSellerReviewSamples, 'SELLER_REVIEWS', 'SELLER_REVIEWS', log, session,
                 );
                 if (samples.negative) seller.feedback.negativeReviewSamples = samples.negative;
                 if (samples.positive) seller.feedback.positiveReviewSamples = samples.positive;
@@ -1944,6 +1977,9 @@ void (async () => {
         };
 
         const secondaryPages: Page[] = [];
+        // A secondary page that lands on the challenge fails the whole request, so it is retried
+        // on a fresh session rather than recorded with no samples.
+        const wall = { hit: false };
         try {
             const tasks: Promise<void>[] = [
                 scrapeSamples(page, `SELLER_${primaryType.toUpperCase()}_REVIEWS`).then(r => { samplesByType[primaryType] = r; })
@@ -1955,13 +1991,17 @@ void (async () => {
                 const label = `SELLER_${t.type.toUpperCase()}_REVIEWS`;
                 tasks.push(
                     secondaryPage.goto(t.url, { waitUntil: 'domcontentloaded', timeout: 40000 })
-                        .then(async () => { samplesByType[t.type] = await scrapeSamples(secondaryPage, label); })
+                        .then(async () => {
+                            if (isCaptchaUrl(secondaryPage.url())) { wall.hit = true; return; }
+                            samplesByType[t.type] = await scrapeSamples(secondaryPage, label);
+                        })
                         .catch((err: unknown) => {
                             log.error(`${label} navigation failed`, { url: t.url, error: (err as Error).message });
                         })
                 );
             }
             await Promise.all(tasks);
+            if (wall.hit) throw blockedError(undefined, true);
             phase('parallel review pages scraped');
 
             // Only the types this fallback was handed — the others were already fetched as HTML.

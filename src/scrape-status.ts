@@ -19,6 +19,8 @@ as dead:
   - ended notice       heuristic — requires BOTH the status-message banner AND the absence of any
                        buy box, so a single selector rotting silently means "live", never "dead".
 */
+import { SessionError } from 'crawlee';
+
 import { currentActorRunId } from './actor-run.js';
 import type {
     CaptureMode,
@@ -59,9 +61,13 @@ export const STATUS_SELECTORS = {
     sellerAlive: '.str-seller-card-wrap, .str-seller-card, article.str-item-card, .fdbk-detail-list, .str-header',
 } as const;
 
-/** Thrown to make Crawlee retry with a fresh session — a walled page is not a dead page. */
+/**
+ * Thrown to make Crawlee retry with a fresh session — a walled page is not a dead page. A
+ * `SessionError` retires the session at once, and with it the browser and its proxy IP; a plain
+ * Error only marked it bad, so the next two retries landed on the same walled IP (2026-10-15).
+ */
 export function blockedError(statusCode: number | undefined, hasEbayHeader: boolean): Error {
-    return new Error(`Likely blocked (status=${statusCode}, hasHeader=${hasEbayHeader}) — retry with new session`);
+    return new SessionError(`Likely blocked (status=${statusCode}, hasHeader=${hasEbayHeader}) — retry with new session`);
 }
 
 export function isGoneStatus(statusCode: number | undefined): boolean {
